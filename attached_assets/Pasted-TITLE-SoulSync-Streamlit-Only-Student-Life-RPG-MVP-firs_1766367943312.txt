@@ -1,0 +1,204 @@
+TITLE: SoulSync — Streamlit‑Only Student Life RPG (MVP-first, MUST RUN on first build)
+
+CONTEXT: You are building inside Replit “Build an app” using the GENERIC “Web App” flow.
+Replit’s Web App flow often defaults to Node/Express. You MUST OVERRIDE that.
+This project MUST be Python + Streamlit ONLY.
+
+PRIMARY GOAL: The very first build must produce a running Streamlit app with:
+- NO external keys required to run
+- SQLite default DB
+- Gemini chat works in fallback mode if GOOGLE_API_KEY is missing
+- Runs on port 3000 (Replit)
+- All pages visible, no crashes
+
+──────────────────────────────────────────────────────────────────────────────
+HARD CONSTRAINTS (FAIL THE BUILD IF VIOLATED)
+
+✅ TECH STACK (ONLY)
+- Python + Streamlit (multi-page using /pages folder)
+- SQLAlchemy ORM
+- DB: SQLite by default; Postgres (Supabase) only via DATABASE_URL env var
+- LLM: Google Gemini via direct HTTP (requests) only if GOOGLE_API_KEY is present
+- Styling: .streamlit/config.toml + assets/theme.css loaded in app.py
+- Tests (optional later): pytest
+
+🚫 FORBIDDEN
+- Node/Express, Next.js, React, Vue, Svelte
+- Flask / FastAPI / Django / Starlette
+- Any separate backend server
+- LangChain / LlamaIndex
+- Any vector DB service
+- Heavy model downloads (e.g., sentence-transformers) in MVP — do not include in requirements for first run
+
+✅ ENTRYPOINT
+App MUST run with:
+  streamlit run app.py --server.address 0.0.0.0 --server.port 3000
+
+✅ REPLIT PROJECT OVERRIDE (CRITICAL FOR WEB APP TEMPLATE)
+1) Create a `.replit` file that sets the run command to the Streamlit command above.
+2) If Replit generated Node files (package.json, server.js, etc.), REMOVE/IGNORE them and DO NOT use Node.
+3) Use requirements.txt for dependencies.
+4) Provide README with exact run instructions and secrets setup.
+
+✅ SECRETS SAFETY
+- Never hardcode secrets.
+- Never print secrets in logs/UI.
+- Read env vars only:
+  - DATABASE_URL (optional; default sqlite:///soulsync.db)
+  - GOOGLE_API_KEY (optional; enables Gemini)
+  - GEMINI_MODEL_ID (optional; default gemini-2.0-flash)
+- If a secret is missing, the app must still run with friendly “Feature disabled” messaging.
+
+──────────────────────────────────────────────────────────────────────────────
+APP GOAL (MVP)
+
+Build a light-themed, student-friendly (ages 13–14) “life RPG” app:
+- Persona-style stats: Knowledge, Guts, Proficiency, Kindness, Charm (levels 1–10)
+- Daily missions personalized from journal check-in
+- Journal with guided prompts + structured check-in
+- “Your Voice” supportive chat coach:
+  - Uses recent journal + missions context
+  - Gemini if GOOGLE_API_KEY is present, else safe fallback response
+
+MVP PAGES (MUST EXIST AND WORK)
+1) Dashboard
+2) Missions
+3) Journal
+4) Your Voice
+5) Settings (diagnostics)
+(Leaderboards + Map + Geolocation can be placeholders for MVP)
+
+──────────────────────────────────────────────────────────────────────────────
+UI / THEME (REQUIRED)
+
+Create `.streamlit/config.toml` exactly:
+[theme]
+primaryColor = "#22B8CF"
+backgroundColor = "#FAFBFF"
+secondaryBackgroundColor = "#F1F5FF"
+textColor = "#1F2937"
+font = "Poppins"
+
+Create `assets/theme.css` and LOAD IT in `app.py`:
+- .ss-card (rounded corners, soft shadow, padding)
+- .ss-chip (emoji mission chips)
+- .ss-bubble (chat bubbles for user vs assistant)
+- Friendly spacing and big headings (Poppins/Nunito fallback)
+
+Accessibility: clear labels, good contrast, keyboard-friendly.
+
+──────────────────────────────────────────────────────────────────────────────
+PERSONALIZATION (MVP, RULE-BASED — NO EMBEDDINGS)
+
+Journal check-in metrics stored as JSON:
+- sleep_hours, meals_text, water_cups, study_minutes, movement_minutes,
+  mood, learned_text, good_thing, challenge
+
+Daily mission generator (rule-based):
+- If sleep_hours < 7 → include a sleep mission
+- If study_minutes < default goal (30) → include a study mission
+- If movement_minutes < default goal (15) → include a movement mission
+- If meals_text missing → include nutrition logging mission
+- Always include 1 reflection mission (3 lines: what I learned + what I’ll try tomorrow)
+- Each mission must show “Why this mission?” one-liner.
+
+Your Voice (context injection):
+- Pull last 3 journal entries + today’s missions + completion status
+- Build a short prompt with kid-safe supportive tone
+- If GOOGLE_API_KEY missing → use friendly fallback response that still references available context.
+
+Gemini call (only if GOOGLE_API_KEY exists):
+- Use requests + timeouts + max 2 tries
+- Model from GEMINI_MODEL_ID (default gemini-2.0-flash)
+- Do NOT use external SDKs
+
+Moderation (MVP):
+- Simple keyword flagging; if triggered show disclaimer + crisis resources
+- Log event in AuditLog
+- Do not produce harmful instructions
+
+──────────────────────────────────────────────────────────────────────────────
+DATA MODEL (SQLAlchemy) — MVP TABLES
+
+Implement these SQLAlchemy models:
+- User(id, email, handle, consent_leaderboard, consent_location, city, region, created_at)
+- Profile(user_id, avatar_url, goals_json, timezone, streak_count, last_login_at)
+- Stat(user_id, type, level, xp, updated_at)
+- Mission(id, title, type, difficulty, xp_reward, is_hidden, geo_rule_json, created_for_date, created_by_system)
+- MissionAssignment(id, user_id, mission_id, date, status, proof_json, completed_at)
+- VoiceMessage(id, user_id, role, text, created_at)
+- JournalEntry(id, user_id, mood, text, tags, created_at, metrics_json)
+- AuditLog(id, user_id, event_type, meta_json, created_at)
+
+DB rules:
+- Default SQLite: sqlite:///soulsync.db
+- If DATABASE_URL exists, use that instead
+- Auto-create tables on startup for MVP
+
+AUTH (MVP):
+- Simple local login: email + handle → store in st.session_state
+
+XP / LEVELS:
+- XP curve: base * n^2, base = 100 default
+- Completing a mission adds XP to mapped stat category
+- Level max 10
+
+──────────────────────────────────────────────────────────────────────────────
+DELIVERABLES (MVP-FIRST, MUST RUN)
+
+1) Working Streamlit app (multi-page) that runs immediately on Replit.
+2) Required theme files and CSS integration.
+3) SQLAlchemy models + DB init (auto-create).
+4) README with:
+   - exact run command
+   - how to add DATABASE_URL, GOOGLE_API_KEY in Replit Secrets
+   - how SQLite fallback works
+5) Create a `.replit` file with run command (mandatory).
+
+MANDATORY FILE TREE
+- .replit
+- app.py
+- pages/
+  - 1_Dashboard.py
+  - 2_Missions.py
+  - 3_Journal.py
+  - 4_Your_Voice.py
+  - 5_Settings.py
+- soulsync/
+  - __init__.py
+  - config.py          (env var loader, masked diagnostics)
+  - db.py              (engine/session)
+  - models.py
+  - services/
+    - stats.py
+    - missions.py
+    - journal.py
+    - voice.py         (Gemini client + fallback)
+    - moderation.py
+  - ui/
+    - theme.py         (CSS loader)
+    - components.py    (cards, chips, bubbles)
+- assets/theme.css
+- .streamlit/config.toml
+- requirements.txt
+- README.md
+- .env.example
+- .gitignore
+
+PHASE-2 (PLACEHOLDER PAGES OK)
+- Map + geolocation + leaderboard (create placeholder pages but do not implement fully now)
+- Embeddings/RAG with sentence-transformers (add later behind a toggle, not in MVP dependencies)
+
+ACCEPTANCE TESTS (MVP)
+- App runs without keys (SQLite + fallback chat).
+- Onboarding creates user + stats.
+- Journal check-in generates missions tailored to inputs.
+- Completing a mission increases XP and updates level correctly.
+- Your Voice references recent journal/missions (even in fallback mode).
+- Settings shows diagnostics without exposing secrets.
+
+START NOW (OUTPUT FORMAT)
+1) Print the file tree.
+2) Print requirements.txt.
+3) Provide full code for all files (complete, runnable).
+4) End with “Stack Compliance Checklist”.
