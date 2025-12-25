@@ -1,6 +1,9 @@
 import streamlit as st
+from datetime import datetime
 from soulsync.db import SessionLocal
 from soulsync.services.stats import get_stats
+from soulsync.services.story_service import get_week_start, get_or_seed_story_for_week, compute_week_progress, evaluate_and_unlock
+from soulsync.models import Profile
 from soulsync.ui.theme import load_css
 
 load_css()
@@ -12,9 +15,9 @@ if "user" not in st.session_state:
 st.title("Dashboard 📊")
 
 db = SessionLocal()
-stats = get_stats(st.session_state.user["id"], db)
-db.close()
 
+# Stats display
+stats = get_stats(st.session_state.user["id"], db)
 cols = st.columns(len(stats) if stats else 1)
 for i, stat in enumerate(stats):
     with cols[i]:
@@ -26,5 +29,39 @@ for i, stat in enumerate(stats):
         </div>
         """, unsafe_allow_html=True)
 
-st.subheader("Recent Activity")
-st.write("Complete missions to level up!")
+# Streak & Shields
+profile = db.query(Profile).filter(Profile.user_id == st.session_state.user["id"]).first()
+if profile:
+    st.markdown(f"""
+    <div class="ss-card">
+        <h3>Streak: {profile.streak_count} 🔥</h3>
+        <p>Shields: {profile.streak_shields_remaining} 🛡️</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# This Week's Arc
+today = datetime.now()
+week_start = get_week_start(today)
+story = get_or_seed_story_for_week(week_start, db)
+progress = compute_week_progress(st.session_state.user["id"], week_start, db)
+
+st.markdown(f"""
+<div class="ss-card">
+    <h3>This Week's Arc 📖</h3>
+    <p><b>{story.title}</b></p>
+    <p>Progress: {progress}/3</p>
+    <div style="background-color: #E3F2FD; height: 10px; border-radius: 5px;">
+        <div style="background-color: #22B8CF; height: 10px; border-radius: 5px; width: {progress*33.3}%;"></div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+if st.button("Read Story", key="btn_read_story"):
+    with st.modal("Story"):
+        st.markdown(story.content_md)
+        if st.button("Mark as Read"):
+            evaluate_and_unlock(st.session_state.user["id"], week_start, db)
+            st.success("Story unlocked!")
+            st.rerun()
+
+db.close()

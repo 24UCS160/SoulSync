@@ -1,0 +1,160 @@
+
+TITLE: SoulSync — Quality Pack LITE (Retention + Planning + Safer Voice) — Streamlit + Postgres + Gemini (requests)
+
+GLOBAL STACK LOCK (NON‑NEGOTIABLE)
+- Runtime/UI: Streamlit native multipage ONLY (root app.py + pages/ directory). Do NOT implement a custom router.
+- DB: PostgreSQL via SQLAlchemy using DATABASE_URL (primary).
+- AI: Gemini free-tier via HTTP requests (keep existing requests-based integration in soulsync/services/voice.py).
+- Preserve existing fallbacks EXACTLY (already implemented):
+  - If GOOGLE_API_KEY missing/fails => deterministic fallback responses + visible “AI offline – basic mode” banner.
+  - If DATABASE_URL missing/unreachable => existing limited mode fallback; app must still load and show a clear Settings warning banner.
+- FORBIDDEN: Flask/FastAPI/Django/Starlette, uvicorn/gunicorn, Node/npm/yarn/pnpm, React/Next/Vue/Svelte/Angular, Docker, microservices, separate API servers.
+- Do not remove or weaken: moderation, privacy opt-ins, export/delete controls, safety messaging.
+- Do not add new dependencies unless necessary.
+
+DEPENDENCY ALLOWLIST (STRICT)
+requirements.txt may include ONLY:
+- streamlit
+- sqlalchemy
+- requests
+- psycopg2-binary
+- watchdog (optional)
+- pytest (required if adding tests)
+- python-dotenv (optional)
+FORBIDDEN PACKAGES:
+fastapi, flask, django, starlette, uvicorn, gunicorn, node tooling, gradio, dash.
+
+ENTRYPOINT CLARITY
+- The ONLY runnable entrypoint is Streamlit: `streamlit run app.py`
+- main.py is a placeholder and must NOT be used:
+  - delete main.py OR replace it with a message “Run Streamlit via app.py”.
+- package.json must NOT be used. Remove if safe; otherwise leave unused and document in README “not used”.
+
+REPLIT BOOT (REQUIRED)
+- Ensure Streamlit runs on internal 8501 (NOT 3000) and binds to external 80.
+Create/ensure .replit contains:
+  run = "streamlit run app.py --server.address 0.0.0.0 --server.port 8501"
+and include:
+  [[ports]]
+  localPort = 8501
+  externalPort = 80
+
+SCOPE: Implement ONLY these 4 features. Do not refactor unrelated modules.
+
+========================================================
+FEATURE 1) Weekly Arc + Story Events (Light Narrative)
+========================================================
+DB (SQLAlchemy):
+- StoryEvent(id, week_start_date, title, theme, trigger_rule_json, content_md, created_at)
+- UserStoryUnlock(id, user_id, story_event_id, unlocked_at)
+
+Logic:
+- Create soulsync/services/story_service.py with:
+  - get_week_start(dt, timezone)
+  - get_or_seed_story_for_week(week_start)
+  - compute_week_progress(user_id, week_start)
+  - evaluate_and_unlock(user_id, week_start)
+
+UI:
+- Modify pages/1_Dashboard.py: add “This Week’s Arc” ss-card with progress 0..3
+- If unlocked: “Read story” opens modal showing content_md
+- Modify pages/5_Settings.py: add “Storybook” listing unlocked stories
+
+========================================================
+FEATURE 2) Streak Shield + Recovery Mission
+========================================================
+DB:
+- Profile: add streak_shields_remaining (int default 2), last_shield_reset_at (datetime)
+- Mission: add is_recovery (bool default false)
+- MissionAssignment: add used_streak_shield (bool default false)
+
+Logic:
+- Weekly reset: reset shields to 2 when week_start advances.
+- If streak breaks and shields>0: create/assign a Recovery Mission for today (is_recovery=true).
+- Completing Recovery Mission:
+  - restores streak_count (using your existing streak rules)
+  - consumes one shield
+  - sets used_streak_shield=true
+
+UI:
+- pages/1_Dashboard.py: show streak + shields remaining (🛡️)
+- pages/2_Missions.py: show Recovery mission with chip “🛡️ Recovery”
+
+========================================================
+FEATURE 3) Smart Mission Planner (Time‑blocking Lite)
+========================================================
+DB:
+- Mission: add duration_minutes (int nullable)
+
+Logic:
+- Create soulsync/services/planner_service.py:
+  - build_plan(user_id, date, minutes_cap) -> list[Mission]
+Rules:
+  - total duration <= cap
+  - variety across mission types
+  - prioritize recovery mission > streak-critical > balanced
+  - deterministic (no Gemini)
+
+UI:
+- pages/2_Missions.py: planner widget (minutes selector + Build Plan + Assign Plan)
+- Prevent duplicates in assignments.
+
+========================================================
+FEATURE 4) Your Voice: Modes + Permission Gate for Private Memory
+========================================================
+Objective:
+- Implement modes without changing stack.
+- Keep existing Gemini call in soulsync/services/voice.py using requests.
+- Add “permission gate” before using private/sensitive journal memory.
+
+Modes:
+- Cheer me on
+- Help me plan
+- Reflect with me
+- Study buddy
+
+Implementation Details:
+- Modify pages/4_Your_Voice.py:
+  - add mode selector stored in st.session_state["voice_mode"]
+  - pass mode into the voice call (context/prompt composition)
+- Modify soulsync/services/voice.py:
+  - update get_ai_response(...) to accept a mode parameter OR accept a richer context string that includes a mode template.
+  - keep existing fallback behavior when GOOGLE_API_KEY missing/fails.
+
+Permission Gate:
+- If retrieved journal/memory includes tags 'private' or 'sensitive':
+  - do NOT include it in the context used for Gemini yet
+  - show: “I found something you wrote earlier that might help. Want me to use it?”
+  - store pending_context_ids in st.session_state
+  - only if user clicks “Yes” -> call get_ai_response with that context
+  - if “No” -> call get_ai_response without it
+
+DB:
+- If JournalEntry tags are not structured, add tags_json (nullable) OR enforce list safely.
+
+========================================================
+IMPLEMENTATION RULES
+========================================================
+- Do not implement a router in app.py. Keep Streamlit native multipage navigation.
+- Do not add Node tooling. package.json must not be required.
+- If you do not have migrations, implement idempotent ensure_schema() that safely CREATE/ALTERs needed tables/columns on startup.
+
+========================================================
+TESTS (REQUIRED if pytest present)
+========================================================
+- test_story_service.py: week start calc; trigger eval; unlock
+- test_streak_shield.py: weekly reset; recovery restores streak; consumes shield
+- test_planner.py: plan duration <= cap; deterministic; no duplicates
+- test_permission_gate.py: private memory triggers consent flow; not used without click
+- test_voice_modes_fallback.py: each mode returns deterministic fallback when GOOGLE_API_KEY missing
+
+ACCEPTANCE CHECKLIST
+- Streamlit-only; no forbidden frameworks/deps.
+- Weekly Arc unlocks after missions; storybook lists unlocked stories.
+- Streak Shield works; Recovery Mission restores streak; weekly reset works.
+- Planner works without Gemini; assigns without duplicates.
+- Voice modes work; private memory never referenced without explicit consent click.
+- Existing onboarding/missions/stats/journal/settings/moderation/export/delete and both fallbacks remain working.
+
+IMPORTANT:
+Implement only what is described. Do not refactor unrelated files. Do not introduce new frameworks or dependencies.
