@@ -1,0 +1,363 @@
+
+TITLE: SoulSync — FINAL DELTA LITE: PlanRun + Gemini AI Daily Missions + Time‑Aware Swaps (Hybrid Journal + Voice) using existing missions.py
+
+ASSUMPTION (DO NOT REBUILD)
+Assume these already exist and DO NOT re-implement:
+- Streamlit multipage structure (app.py + pages/)
+- PostgreSQL SQLAlchemy wiring via DATABASE_URL
+- Gemini integration via HTTP requests (requests) in soulsync/services/voice.py, including fallback behavior
+- Existing “Quality Pack LITE” features if previously applied (weekly arc, streak shields, planner UI, voice modes/permission gate)
+
+YOUR TASK (ONLY THIS DELTA)
+(1) Add PlanRun model and wire it for idempotency + plan versions + swap tracking.
+(2) Upgrade soulsync/services/missions.py to use Gemini to intelligently generate daily missions using BOTH Journal signals and Voice intent.
+(3) Implement Gemini-powered swaps (up to 3 pending missions) that also account for time remaining using dual “day end” rules:
+    - bedtime cutoff for study/focus/active tasks
+    - midnight for reflection/sleep/wind-down tasks
+(4) Wire Journal and Voice triggers cleanly so Journal stays “private capture” and Voice stays “introspection tool”.
+
+GLOBAL STACK LOCK (NON‑NEGOTIABLE)
+- Streamlit multipage ONLY. No Flask/FastAPI/Django/Node/React/Docker/separate server.
+- DB: Postgres via SQLAlchemy using DATABASE_URL.
+- Gemini via HTTP requests using requests (keep existing approach; no new SDK).
+- Preserve fallbacks:
+  - If GOOGLE_API_KEY missing/fails => deterministic fallback responses + “AI offline – basic mode” banner.
+  - If DATABASE_URL missing/unreachable => existing limited mode fallback still loads app.
+- Do not add new dependencies unless absolutely necessary.
+
+DEPENDENCY ALLOWLIST
+requirements.txt may include ONLY:
+streamlit, sqlalchemy, requests, psycopg2-binary, watchdog(optional), pytest(optional), python-dotenv(optional).
+Forbidden: fastapi, flask, django, starlette, uvicorn, gunicorn, node tooling, gradio, dash.
+
+========================================================
+A) ADD PlanRun MODEL (REQUIRED)
+========================================================
+Add SQLAlchemy model PlanRun:
+- id (PK)
+- user_id (FK -> User.id)
+- date (DATE or ISO string consistently with your app)
+- plan_version (int, starts at 1 for the base plan)
+- source (ENUM: journal, voice, missions_page)
+- kind (ENUM: full_plan, swap)
+- status (ENUM: previewed, assigned, superseded, cancelled)
+- created_at (datetime)
+- meta_json (JSON) to store:
+  - minutes_cap
+  - now_local, bedtime_cutoff_local, midnight_local
+  - mins_to_bedtime, mins_to_midnight, effective_mins_to_bedtime, effective_mins_to_midnight
+  - swap_limit, swap_count
+  - validation_errors (if any)
+  - trigger_summary (short)
+
+Add plan_run_id foreign key to MissionAssignment (preferred) OR to Mission.
+- MissionAssignment.plan_run_id (FK -> PlanRun.id)
+
+Rules:
+- Exactly ONE assigned full_plan per user per date.
+- Swaps are recorded as PlanRun(kind="swap", status="assigned") and store swap_index in meta_json:
+  meta_json includes {"swap_index": 1..N} while the base plan_version remains the same for the day unless user regenerates full plan.
+
+Idempotency:
+- If a full_plan is already assigned today, do not reassign on reruns.
+- Only create a new plan if the user explicitly clicks “Regenerate plan” or “Apply swaps”.
+
+========================================================
+B) USER DAY-END RULES (REQUIRED: option 3)
+========================================================
+Add Settings field to Profile (or similar):
+- day_end_time_local (HH:MM), default 21:30
+Explain in UI:
+- Before day_end_time: planning/swaps may include study/focus/active missions.
+- After day_end_time until midnight: only reflection/sleep/wind-down micro missions may be added/swapped in.
+
+Define task categories for enforcement:
+- “Active” types (restricted after bedtime cutoff): study, fitness, chores, social, nutrition
+- “Wind-down” types (allowed after bedtime cutoff): reflection, sleep
+Additionally: after bedtime cutoff, only allow EASY difficulty and <= 15 minutes (prefer micro).
+
+Compute per user:
+- now_local (timezone-aware)
+- bedtime_cutoff_local = today at day_end_time_local in user timezone
+- midnight_local = today at 23:59 in user timezone
+- mins_to_bedtime = max(0, bedtime_cutoff_local - now_local)
+- mins_to_midnight = max(0, midnight_local - now_local)
+- buffer_minutes = 15 (fixed)
+- effective_mins_to_bedtime = max(0, mins_to_bedtime - buffer_minutes)
+- effective_mins_to_midnight = max(0, mins_to_midnight - buffer_minutes)
+
+These values MUST be written into PlanRun.meta_json for both full_plan and swap runs.
+
+========================================================
+C) JOURNAL SIGNALS EXTRACTION (PRIVATE CAPTURE, JSON-only)
+========================================================
+In pages/3_Journal.py after saving a JournalEntry:
+- Extract structured signals via Gemini JSON-only “journal_signal_extractor”.
+- Store latest signals per user.
+
+Storage options:
+- Preferred: JournalSignal(id, user_id, journal_entry_id, signals_json, created_at)
+- Or reuse VoiceMemory(kind="journal_signal") with JSON in content.
+
+Signals schema (validate strictly):
+{
+  "mood": "happy|neutral|sad|stressed|angry|tired|excited|anxious|other",
+  "energy": 1-5,
+  "focus": 1-5,
+  "stress": 1-5,
+  "wins": ["..."],
+  "blockers": ["..."],
+  "needs": ["sleep|food|movement|break|help|confidence|time|quiet|other"],
+  "intent": "one short sentence",
+  "privacy_tags": ["private"|"sensitive"|...],
+  "safety_flag": true|false,
+  "safety_reason": "..."
+}
+
+Journal UI:
+- Show “Saved privately ✅”
+- Show “Signals detected” card (energy/focus/stress).
+- Buttons:
+  - “Generate today’s AI plan” (preview -> assign)
+  - “Suggest swaps (up to 3)” (preview -> apply swaps)
+Note: Journal must NOT behave like a chatbot and must NOT provide advice.
+
+Fallback:
+- If Gemini unavailable or JSON invalid -> deterministic signals from mood only.
+
+========================================================
+D) UPGRADE missions.py: GEMINI AI DAILY PLANNER (creates NEW missions daily)
+========================================================
+Your existing file: soulsync/services/missions.py.
+It currently uses hard-set rules. Replace/extend logic with AI-first pipeline:
+
+Required functions in soulsync/services/missions.py:
+
+1) build_planner_context(user_id, date, minutes_cap, db, journal_signals_json, voice_intent_summary, time_context)
+Includes:
+- goals/profile hints
+- streak and last-7-days completion summary
+- latest journal signals JSON
+- voice_intent_summary (1–2 lines) if provided
+- time_context:
+  now_local, bedtime_cutoff_local, midnight_local,
+  effective_mins_to_bedtime, effective_mins_to_midnight
+- HARD RULES:
+  - If effective_mins_to_bedtime == 0, active task types are restricted (wind-down only).
+
+2) generate_ai_plan_json(context) -> plan_json
+- Calls Gemini with JSON-only planner prompt (strict schema below).
+- Planner must obey day-end rules:
+  - If before bedtime cutoff: missions can include active + wind-down types.
+  - If after bedtime cutoff: missions must only include reflection/sleep (wind-down) and be short/easy.
+
+3) validate_plan(plan_json, minutes_cap, time_context) -> (ok, errors)
+Enforce:
+- 5–7 missions
+- allowed types only: study, fitness, sleep, nutrition, reflection, social, chores
+- total duration <= minutes_cap
+- micro required (<= 5 minutes)
+- xp range enforced
+- no duplicate titles
+- unsafe/adult keyword filter
+Time-aware enforcement:
+- If effective_mins_to_bedtime == 0:
+  - prohibit types: study, fitness, chores, social, nutrition
+  - allow only: reflection, sleep
+  - cap duration_minutes <= 15 and difficulty==easy
+- Also check that total duration does not exceed:
+  - before bedtime: <= minutes_cap
+  - after bedtime: <= min(minutes_cap, effective_mins_to_midnight)
+
+4) preview_plan(user_id, date, source, db, context) -> (PlanRun, plan_json)
+- Create PlanRun(kind="full_plan", status="previewed", plan_version=current+1 if regenerating else current)
+- Store time_context and minutes_cap in meta_json
+- Does NOT create Mission rows yet.
+
+5) assign_plan_creating_daily_missions(user_id, date, plan_json, db, plan_run)
+Daily new mission rule:
+- MUST create NEW Mission rows for the day.
+- Mission.created_for_date = date; Mission.created_by_system = true.
+- Create MissionAssignments referencing plan_run_id.
+- Include micro fields on Mission for every mission:
+  micro_title, micro_duration_minutes, micro_xp_reward.
+
+Idempotency:
+- If there is already an assigned PlanRun(kind="full_plan") for that date AND user does not regenerate:
+  - return existing assigned plan; do not create duplicates.
+Regenerate:
+- Only when user explicitly clicks regenerate:
+  - supersede the previous assigned full_plan PlanRun (status=superseded)
+  - archive previous pending assignments (NOT completed)
+  - create new PlanRun with plan_version+1 and assign new missions
+
+Planner JSON schema (strict):
+{
+  "date": "YYYY-MM-DD",
+  "timezone": "Area/City",
+  "missions": [
+    {
+      "title": "...",
+      "type": "study|fitness|sleep|nutrition|reflection|social|chores",
+      "difficulty": "easy|medium|hard",
+      "duration_minutes": 5-60,
+      "xp_reward": 5-60,
+      "stat_targets": ["knowledge","guts","proficiency","kindness","charm"],
+      "micro": { "title": "...", "duration_minutes": 1-5, "xp_reward": 3-15 },
+      "why_this": "one short sentence"
+    }
+  ],
+  "notes": "one short sentence"
+}
+
+========================================================
+E) GEMINI INTELLIGENT SWAPS (up to 3) WITH TIME-AWARE DAY-END LOGIC
+========================================================
+Swaps can replace up to 3 pending missions, but must fit time remaining.
+
+Swap rules:
+- Only swap MissionAssignments with status=pending.
+- Never change completed missions.
+- Swap_count can be 0–3:
+  - If effective time is too low, Gemini may return swap_count=0 with no_swap_reason.
+- Swaps create NEW Mission rows for replacements and new assignments.
+- Archive swapped-out assignments with proof_json including:
+  {"swapped_out": true, "swap_plan_run_id": <id>} and status="archived" (or failed if you lack archived status).
+- Record PlanRun(kind="swap") for each swap action; store swap_index in meta_json.
+
+Time-aware swap behavior (option 3):
+- Before bedtime cutoff:
+  - replacements (sum of new durations) must fit within effective_mins_to_bedtime
+  - allowed replacement types include active + wind-down
+- After bedtime cutoff until midnight:
+  - replacements must fit within effective_mins_to_midnight
+  - ONLY allow reflection/sleep (wind-down) replacements
+  - difficulty must be easy; duration <= 15; prefer micro
+Dynamic swap limit:
+- If effective_mins_to_bedtime < 15 and before cutoff -> swap_limit=1
+- If 15–30 -> swap_limit=2
+- Else -> swap_limit=3
+After cutoff use effective_mins_to_midnight for these thresholds.
+
+Implement in soulsync/services/missions.py:
+
+1) propose_swaps(user_id, date, minutes_cap, db, journal_signals_json, voice_intent_summary, time_context) -> swap_json
+- Gemini receives:
+  - list of pending missions (title/type/duration)
+  - time_context (mins remaining to bedtime and to midnight)
+  - swap_limit (dynamic)
+  - day-end rules
+
+2) validate_swap_plan(swap_json, pending_missions, time_context) -> (ok, errors)
+Enforce:
+- swap_count between 0 and 3 and <= swap_limit
+- replace_title must exactly match an existing pending mission title
+- no duplicates in replace_title
+- replacements obey allowlist + micro required + xp ranges
+- unsafe/adult filter
+- total replacement duration <= effective available minutes:
+  - before cutoff: <= effective_mins_to_bedtime
+  - after cutoff: <= effective_mins_to_midnight
+- after cutoff: replacements must be only reflection/sleep, easy, <=15 mins
+
+3) apply_swaps(user_id, date, swap_json, db, source, time_context) -> PlanRun
+- Create PlanRun(kind="swap", status="assigned", source=journal|voice|missions_page)
+- Write time_context and swap_count into meta_json, including swap_index.
+- Apply replacements:
+  - archive swapped-out assignments
+  - create new Mission rows (created_for_date=today)
+  - create new MissionAssignments(pending) linked to swap PlanRun
+- Write AuditLog event_type="missions_swapped" meta_json includes counts + source + swap_index.
+
+Swap JSON schema (strict):
+{
+  "date": "YYYY-MM-DD",
+  "swap_count": 0-3,
+  "no_swap_reason": "short string if swap_count=0",
+  "replacements": [
+    {
+      "replace_title": "EXACT title of existing pending mission",
+      "new_mission": {
+        "title": "...",
+        "type": "study|fitness|sleep|nutrition|reflection|social|chores",
+        "difficulty": "easy|medium|hard",
+        "duration_minutes": 5-60,
+        "xp_reward": 5-60,
+        "stat_targets": ["knowledge","guts","proficiency","kindness","charm"],
+        "micro": { "title": "...", "duration_minutes": 1-5, "xp_reward": 3-15 },
+        "why_this": "one short sentence"
+      },
+      "reason": "one short sentence"
+    }
+  ],
+  "notes": "one short sentence"
+}
+
+========================================================
+F) WIRE HYBRID TRIGGERS (Journal + Voice) TO missions.py
+========================================================
+Journal trigger (pages/3_Journal.py):
+- Buttons call missions.py:
+  - preview_plan + assign_plan_creating_daily_missions (full plan)
+  - propose_swaps + apply_swaps (swap)
+Use latest journal_signals_json as input.
+
+Voice trigger (pages/4_Your_Voice.py):
+- Add tool buttons:
+  - “Build today’s plan from this chat”
+  - “Swap up to 3 missions based on this chat”
+Compute voice_intent_summary (1–2 lines) from last user messages:
+- rule-based OR Gemini JSON extractor:
+  {"intent_summary":"...", "priority":"focus|sleep|stress|confidence|health|relationships", "constraints":["..."]}
+Pass BOTH journal_signals_json and voice_intent_summary into planner/swapper.
+
+Purpose distinction copy:
+- Journal: “Private log → signals for planning.”
+- Voice: “Optimistic but critical introspection → optional planning tool.”
+
+========================================================
+G) GEMINI REQUEST SETTINGS (REQUIRED)
+========================================================
+Use requests-based calls (like existing voice.py) with generationConfig:
+- Signals extractor: temperature 0.2, maxOutputTokens 300
+- Planner: temperature 0.3, maxOutputTokens 900
+- Swapper: temperature 0.25, maxOutputTokens 700
+- Voice intent extractor (if used): temperature 0.2, maxOutputTokens 120
+Always use timeout and robust JSON parsing; if parsing fails => fallback.
+
+========================================================
+FILES TO CREATE/MODIFY
+========================================================
+Modify:
+- soulsync/services/missions.py (AI planner + swaps + time logic + PlanRun usage)
+- soulsync/models.py (PlanRun, FK plan_run_id, Profile.day_end_time_local, JournalSignal if needed)
+- pages/3_Journal.py (signals extraction + plan/swap UI)
+- pages/4_Your_Voice.py (plan/swap tool actions)
+- pages/2_Missions.py (show time left today; preview/apply swaps; preview/assign plan; display day end time)
+- pages/5_Settings.py (day_end_time_local setting UI with explanation)
+- README.md (document hybrid plan/swap + time-aware day end rules + PlanRun)
+
+Optional (recommended):
+- soulsync/services/gemini_client.py to centralize request + robust JSON parsing (used by missions.py and voice.py)
+
+========================================================
+ACCEPTANCE CHECKLIST (MUST PASS)
+========================================================
+- PlanRun exists and is used:
+  - assigned full_plan is idempotent per user-date
+  - plan_version increments on regenerate full plan
+  - swaps recorded as PlanRun(kind="swap") with swap_index in meta_json
+- Daily plan uses BOTH Journal signals and Voice intent when available.
+- Assigning plan ALWAYS creates NEW Mission rows for that date.
+- Swap can replace up to 3 pending missions.
+- Swaps account for time remaining:
+  - Before bedtime cutoff: swaps fit within effective_mins_to_bedtime.
+  - After bedtime cutoff: swaps fit within effective_mins_to_midnight and ONLY wind-down mission types (reflection/sleep), easy, short.
+  - If time too low: swap_count=0 allowed with no_swap_reason.
+- Completed missions are never swapped.
+- Validation rejects bad Gemini output and falls back safely.
+- No forbidden frameworks/deps introduced; Streamlit-only run path preserved.
+- Existing fallbacks remain working.
+
+IMPORTANT:
+Implement ONLY this delta. Do not refactor unrelated files. Do not introduce new frameworks or dependencies.
