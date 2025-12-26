@@ -482,3 +482,183 @@ def complete_mission(assignment_id: int, db: Session):
             stat_type = stat_map.get(mission.type, "Proficiency")
             add_xp(assign.user_id, stat_type, mission.xp_reward, db)
         db.commit()
+
+# Swap proposal functions (Step 3C)
+
+def get_pending_missions(user_id: int, date_str: str, db: Session) -> list:
+    """
+    Get all pending missions for a given date.
+    
+    Args:
+        user_id: User ID
+        date_str: YYYY-MM-DD
+        db: Database session
+    
+    Returns:
+        List of dicts with {title, type, duration_minutes, xp_reward}
+    """
+    assignments = db.query(MissionAssignment).filter(
+        MissionAssignment.user_id == user_id,
+        MissionAssignment.date == date_str,
+        MissionAssignment.status == "pending"
+    ).all()
+    
+    pending = []
+    for assign in assignments:
+        mission = db.query(Mission).filter(Mission.id == assign.mission_id).first()
+        if mission:
+            pending.append({
+                "title": mission.title,
+                "type": mission.type,
+                "duration_minutes": mission.duration_minutes or 30,
+                "xp_reward": mission.xp_reward or 10
+            })
+    
+    return pending
+
+def propose_swaps(
+    user_id: int,
+    date_str: str,
+    minutes_cap: int,
+    db: Session,
+    journal_signals_json: dict = None,
+    voice_intent_summary: dict = None
+) -> dict:
+    """
+    Propose swaps for pending missions using Gemini.
+    
+    Args:
+        user_id: User ID
+        date_str: YYYY-MM-DD
+        minutes_cap: Daily minutes cap
+        db: Database session
+        journal_signals_json: Optional journal signals dict
+        voice_intent_summary: Optional voice intent dict
+    
+    Returns:
+        Swap JSON dict with schema:
+        {
+          "date": "YYYY-MM-DD",
+          "swap_count": 0-3,
+          "no_swap_reason": "short if 0",
+          "replacements": [{"replace_title": "...", "new_mission": {...}, "reason": "..."}],
+          "notes": "..."
+        }
+    """
+    # Get pending missions
+    pending_missions = get_pending_missions(user_id, date_str, db)
+    
+    if not pending_missions:
+        return {
+            "date": date_str,
+            "swap_count": 0,
+            "no_swap_reason": "No pending missions to swap.",
+            "replacements": [],
+            "notes": ""
+        }
+    
+    # Compute time context
+    time_context = compute_time_context(user_id, db)
+    
+    # Determine if after bedtime cutoff
+    after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
+    effective_mins = time_context.get("effective_mins_to_midnight" if after_bedtime else "effective_mins_to_bedtime", 0)
+    
+    # Calculate dynamic swap_limit based on remaining time
+    if effective_mins < 15:
+        swap_limit = 1
+    elif effective_mins < 30:
+        swap_limit = 2
+    else:
+        swap_limit = 3
+    
+    # Build pending missions list for prompt
+    pending_str = "\n".join([f"- {m['title']} ({m['type']}, {m['duration_minutes']} mins, +{m['xp_reward']} XP)" for m in pending_missions])
+    
+    # Build constraints string
+    if after_bedtime:
+        time_constraint = f"After bedtime cutoff. Only reflection/sleep allowed, easy difficulty, max 15 mins per mission. Time left: {effective_mins} mins (to midnight)."
+    else:
+        time_constraint = f"Before bedtime cutoff. Any mission type allowed. Time left: {effective_mins} mins (to bedtime), then {time_context.get('effective_mins_to_midnight', 0)} mins to midnight."
+    
+    # Build signals summary
+    signals_str = ""
+    if journal_signals_json:
+        mood = journal_signals_json.get("mood", "")
+        energy = journal_signals_json.get("energy", 3)
+        stress = journal_signals_json.get("stress", 2)
+        signals_str = f"\nJournal signals: mood={mood}, energy={energy}/5, stress={stress}/5. Wins: {journal_signals_json.get('wins', [])}. Needs: {journal_signals_json.get('needs', [])}."
+    
+    if voice_intent_summary:
+        intent = voice_intent_summary.get("intent_summary", "")
+        priority = voice_intent_summary.get("priority", "")
+        signals_str += f"\nVoice intent: {intent}. Priority: {priority}."
+    
+    prompt = f"""You are a mission swap assistant. Propose up to {swap_limit} swaps to improve the user's day.
+
+Pending missions:
+{pending_str}
+
+Time context:
+{time_constraint}
+{signals_str}
+
+Rules:
+1. Only swap pending missions (not completed ones).
+2. Each swap replaces one pending mission with a NEW mission of same/similar type.
+3. Total replacements duration must fit available time.
+4. If after bedtime: ONLY reflection/sleep, easy difficulty, max 15 mins each.
+5. Each replacement needs a "reason" (1-2 sentences why this swap helps).
+6. If you can't improve the day, return swap_count=0 with a short no_swap_reason.
+
+Return ONLY valid JSON, no markdown:
+{{
+  "date": "{date_str}",
+  "swap_count": 0-{swap_limit},
+  "no_swap_reason": "short if swap_count=0, empty otherwise",
+  "replacements": [
+    {{
+      "replace_title": "exact title of pending mission to replace",
+      "new_mission": {{
+        "title": "new mission title",
+        "type": "study|fitness|sleep|nutrition|reflection|social|chores",
+        "difficulty": "easy|medium|hard",
+        "duration_minutes": 5-60,
+        "xp_reward": 5-60,
+        "stat_targets": ["stat1", "stat2"],
+        "micro": {{"title": "micro title", "duration_minutes": 1-5, "xp_reward": 3-15"}},
+        "why_this": "one sentence why"
+      }},
+      "reason": "1-2 sentence reason for swap"
+    }}
+  ],
+  "notes": "brief note"
+}}"""
+    
+    # Call Gemini
+    swap_json = call_gemini_json(prompt, temperature=0.25, max_tokens=700)
+    
+    if not swap_json:
+        # Fallback: no swaps
+        return {
+            "date": date_str,
+            "swap_count": 0,
+            "no_swap_reason": "AI swap assistant unavailable.",
+            "replacements": [],
+            "notes": ""
+        }
+    
+    # Ensure required keys exist
+    if "swap_count" not in swap_json:
+        swap_json["swap_count"] = 0
+    if "replacements" not in swap_json:
+        swap_json["replacements"] = []
+    if "no_swap_reason" not in swap_json:
+        swap_json["no_swap_reason"] = ""
+    if "notes" not in swap_json:
+        swap_json["notes"] = ""
+    
+    # Enforce swap_count <= swap_limit
+    swap_json["swap_count"] = min(swap_json.get("swap_count", 0), swap_limit)
+    
+    return swap_json
