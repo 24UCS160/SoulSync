@@ -1,0 +1,125 @@
+
+TITLE: SoulSync — Step 3/3: Hybrid triggers (Journal+Voice) + Gemini swaps up to 3 + time remaining rules (bedtime vs midnight)
+
+GLOBAL STACK LOCK
+- Streamlit multipage only.
+- Postgres SQLAlchemy DATABASE_URL.
+- Gemini via requests (existing style).
+- Preserve fallbacks (AI offline, DB fallback).
+- No new deps.
+
+ASSUMPTION
+- PlanRun + day_end_time_local exist (Step 1).
+- AI full plan preview/assign exists (Step 2).
+
+GOAL
+1) Implement Journal signals extraction (JSON-only, no advice).
+2) Implement Voice intent summary extraction (1–2 lines).
+3) Implement swaps (up to 3) for PENDING missions using Gemini, validated, and time-aware:
+   - Before bedtime cutoff: swaps must fit effective_mins_to_bedtime and can include active + wind-down types.
+   - After bedtime cutoff until midnight: swaps must fit effective_mins_to_midnight and ONLY allow reflection/sleep, easy, <=15 minutes (prefer micro).
+4) Wire triggers:
+   - Journal can generate full plan and suggest/apply swaps.
+   - Voice can generate full plan and suggest/apply swaps.
+   - Both use the same missions service functions.
+5) Swaps create NEW Mission rows and archive swapped-out pending assignments. Completed missions never change.
+
+SCOPE
+- Implement swaps + journal/voice wiring only.
+- Do not rebuild the planner.
+- Keep UX separation clear: Journal = private capture; Voice = introspection tool + optional planning tool action.
+
+A) Journal Signals Extraction
+- In pages/3_Journal.py after saving journal entry:
+  - Call Gemini “journal_signal_extractor” prompt that returns JSON ONLY (no advice).
+  - Store latest signals per user:
+    - Add JournalSignal table if not present OR reuse VoiceMemory(kind="journal_signal").
+- Show “Signals detected” card after save.
+- Add buttons:
+  - “Generate today’s AI plan” (uses signals in planner context)
+  - “Suggest swaps (up to 3)” (uses signals in swap context)
+
+Signals schema:
+{
+  "mood":"happy|neutral|sad|stressed|angry|tired|excited|anxious|other",
+  "energy":1-5,"focus":1-5,"stress":1-5,
+  "wins":["..."],"blockers":["..."],"needs":["..."],
+  "intent":"one short sentence",
+  "privacy_tags":["private"|"sensitive"|...],
+  "safety_flag":true|false,"safety_reason":"..."
+}
+Fallback: if Gemini unavailable => deterministic minimal signals from mood.
+
+B) Voice Intent Summary
+- In pages/4_Your_Voice.py add tool buttons:
+  - “Build today’s plan from this chat”
+  - “Swap up to 3 missions based on this chat”
+- Create voice_intent_summary (1–2 lines):
+  - Prefer small Gemini JSON extractor:
+    {"intent_summary":"...", "priority":"focus|sleep|stress|confidence|health|relationships", "constraints":["..."]}
+  - Fallback rule-based summary if Gemini unavailable.
+
+C) Swaps Implementation (in soulsync/services/missions.py)
+Add functions:
+1) propose_swaps(user_id, date, minutes_cap, db, journal_signals_json, voice_intent_summary) -> swap_json
+   - Provide Gemini:
+     - list of pending missions (title/type/duration)
+     - time_context (now, bedtime cutoff, midnight, effective mins to bedtime/midnight)
+     - dynamic swap_limit based on remaining effective minutes:
+       <15 => 1, 15–30 => 2, else 3
+     - rule: after bedtime cutoff, only reflection/sleep and short/easy
+   - Swap JSON schema (allow swap_count 0–3):
+     {
+       "date":"YYYY-MM-DD",
+       "swap_count":0-3,
+       "no_swap_reason":"short if 0",
+       "replacements":[
+         {
+           "replace_title":"exact pending mission title",
+           "new_mission":{... same mission schema incl micro ...},
+           "reason":"one short sentence"
+         }
+       ],
+       "notes":"..."
+     }
+
+2) validate_swap_plan(swap_json, pending_missions, time_context) -> (ok, errors)
+   Enforce:
+   - swap_count <= 3 and <= swap_limit
+   - replace_title must match existing pending titles
+   - replacements obey mission validation rules (types, xp, micro required, no unsafe)
+   - TIME LIMIT:
+     - before bedtime cutoff: sum(new durations) <= effective_mins_to_bedtime
+     - after bedtime cutoff: sum(new durations) <= effective_mins_to_midnight AND types only reflection/sleep AND easy AND duration<=15
+   - If swap_count==0 => replacements empty and no_swap_reason present.
+
+3) apply_swaps(user_id, date, swap_json, db, source) -> PlanRun
+   - Create PlanRun(kind="swap", status="assigned", source=journal|voice|missions_page)
+   - Store time_context + swap_limit + swap_count + swap_index in meta_json
+   - For each replacement:
+     - archive swapped-out pending assignment (status="archived" or failed) and proof_json {"swapped_out":true,"swap_plan_run_id":<id>}
+     - create NEW Mission row for today and new MissionAssignment pending linked to swap PlanRun
+   - Log AuditLog event_type="missions_swapped" meta_json
+
+D) UI wiring for swaps and plan
+- pages/2_Missions.py:
+  - show “Time left today: X mins (until bedtime cutoff), wind-down time: Y mins (until midnight)”
+  - add buttons:
+    - “Suggest swaps” -> preview replacements and reasons
+    - “Apply swaps” -> calls apply_swaps
+- Journal and Voice buttons should navigate to Missions preview state or call preview in place.
+
+PRIVACY RULES
+- Never quote journal text verbatim in planner/swapper context.
+- If privacy_tags include private/sensitive, only pass high-level signals (energy/focus/stress/needs) to Gemini.
+
+ACCEPTANCE
+- Swaps only affect pending missions.
+- Up to 3 swaps, but dynamic limit enforced by time remaining.
+- After bedtime cutoff: swaps only produce reflection/sleep short easy missions; study/focus tasks are forbidden.
+- If time is too low: swap_count=0 with no_swap_reason.
+- Every replacement creates NEW Mission rows; swapped-out assignments are archived.
+- Journal remains private capture; Voice remains introspection tool with explicit plan/swap actions.
+
+IMPORTANT:
+Implement only Step 3. Do not refactor unrelated files or introduce new frameworks/deps.
