@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from ..models import Mission, MissionAssignment, Profile, PlanRun, User
+from ..models import Mission, MissionAssignment, Profile, PlanRun, User, AuditLog
 from datetime import date, datetime, timedelta
 import json
 from .gemini_client import call_gemini_json
@@ -787,3 +787,135 @@ def validate_swap_plan(swap_json: dict, pending_missions: list, time_context: di
             errors.append(f"Before bedtime: total replacement duration {total_duration} exceeds bedtime limit {time_limit} mins")
     
     return len(errors) == 0, errors
+
+def apply_swaps(user_id: int, date_str: str, swap_json: dict, db: Session, source: str = "missions_page") -> PlanRun:
+    """
+    Apply validated swaps: archive old pending assignments, create new missions and assignments.
+    
+    Args:
+        user_id: User ID
+        date_str: YYYY-MM-DD
+        swap_json: Validated swap JSON (should pass validate_swap_plan first)
+        db: Database session
+        source: Origin ("missions_page", "journal", or "voice")
+    
+    Returns:
+        PlanRun object with kind="swap", status="assigned"
+    """
+    # Get pending missions and time context for meta_json
+    pending_missions = get_pending_missions(user_id, date_str, db)
+    time_context = compute_time_context(user_id, db)
+    
+    # Calculate swap_limit
+    after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
+    effective_mins = time_context.get("effective_mins_to_midnight" if after_bedtime else "effective_mins_to_bedtime", 0)
+    
+    if effective_mins < 15:
+        swap_limit = 1
+    elif effective_mins < 30:
+        swap_limit = 2
+    else:
+        swap_limit = 3
+    
+    swap_count = swap_json.get("swap_count", 0)
+    replacements = swap_json.get("replacements", [])
+    
+    # Create PlanRun for this swap batch
+    plan_run = PlanRun(
+        user_id=user_id,
+        date=date_str,
+        plan_version=1,
+        source=source,
+        kind="swap",
+        status="assigned",
+        meta_json={
+            "time_context": time_context,
+            "swap_limit": swap_limit,
+            "swap_count": swap_count,
+            "swap_json": swap_json
+        }
+    )
+    db.add(plan_run)
+    db.commit()
+    db.refresh(plan_run)
+    
+    # Process replacements
+    for swap_index, repl in enumerate(replacements):
+        replace_title = repl.get("replace_title", "")
+        new_mission_data = repl.get("new_mission", {})
+        
+        # Find and archive the pending assignment
+        old_assign = db.query(MissionAssignment).filter(
+            MissionAssignment.user_id == user_id,
+            MissionAssignment.date == date_str,
+            MissionAssignment.status == "pending"
+        ).join(Mission).filter(Mission.title == replace_title).first()
+        
+        if old_assign:
+            old_assign.status = "archived"
+            if old_assign.proof_json is None:
+                old_assign.proof_json = {}
+            old_assign.proof_json["swapped_out"] = True
+            old_assign.proof_json["swap_plan_run_id"] = plan_run.id
+        
+        # Create new mission
+        new_mission = Mission(
+            title=new_mission_data.get("title", ""),
+            type=new_mission_data.get("type", ""),
+            difficulty=new_mission_data.get("difficulty", "easy"),
+            xp_reward=new_mission_data.get("xp_reward", 10),
+            duration_minutes=new_mission_data.get("duration_minutes", 30),
+            created_for_date=date_str,
+            created_by_system=True
+        )
+        
+        # Store micro and why_this in geo_rule_json
+        micro = new_mission_data.get("micro", {})
+        why_this = new_mission_data.get("why_this", "")
+        reason = repl.get("reason", "")
+        
+        new_mission.geo_rule_json = {
+            "why": why_this,
+            "swap_reason": reason,
+            "micro_title": micro.get("title", ""),
+            "micro_duration_minutes": micro.get("duration_minutes", 0),
+            "micro_xp_reward": micro.get("xp_reward", 0),
+            "swap_index": swap_index
+        }
+        
+        db.add(new_mission)
+        db.commit()
+        db.refresh(new_mission)
+        
+        # Create assignment linked to swap PlanRun
+        new_assign = MissionAssignment(
+            user_id=user_id,
+            mission_id=new_mission.id,
+            date=date_str,
+            status="pending",
+            plan_run_id=plan_run.id
+        )
+        db.add(new_assign)
+    
+    db.commit()
+    
+    # Log to AuditLog if available
+    try:
+        audit = AuditLog(
+            user_id=user_id,
+            event_type="missions_swapped",
+            meta_json={
+                "date": date_str,
+                "swap_count": swap_count,
+                "swap_limit": swap_limit,
+                "source": source,
+                "plan_run_id": plan_run.id
+            }
+        )
+        db.add(audit)
+        db.commit()
+    except Exception:
+        # AuditLog may not exist, silently pass
+        pass
+    
+    return plan_run
