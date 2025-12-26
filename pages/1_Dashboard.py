@@ -56,12 +56,22 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-if st.button("Read Story", key="btn_read_story"):
-    with st.modal("Story"):
-        st.markdown(story.content_md)
-        if st.button("Mark as Read"):
-            evaluate_and_unlock(st.session_state.user["id"], week_start, db)
+@st.dialog("Story", width="medium", dismissible=True)
+def show_story_dialog(story_md: str, user_id: int, week_start, db):
+    st.markdown(story_md)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Mark as Read ✅", key="btn_mark_story_read"):
+            evaluate_and_unlock(user_id, week_start, db)
             st.success("Story unlocked!")
             st.rerun()
 
+    with col2:
+        if st.button("Close", key="btn_close_story"):
+            st.rerun()
+
+
+if st.button("Read Story", key="btn_read_story"):
+    show_story_dialog(story.content_md, st.session_state.user["id"], week_start, db)
 db.close()
