@@ -19,15 +19,18 @@ def ensure_schema():
         with engine.connect() as conn:
             inspector = inspect(engine)
             
-            # Check if tables exist first
+            # Profile: day_end_time_local
             if inspector.has_table('profiles'):
                 profile_cols = [c['name'] for c in inspector.get_columns('profiles')]
                 if 'streak_shields_remaining' not in profile_cols:
                     conn.execute(text("ALTER TABLE profiles ADD COLUMN streak_shields_remaining INTEGER DEFAULT 2"))
                 if 'last_shield_reset_at' not in profile_cols:
                     conn.execute(text("ALTER TABLE profiles ADD COLUMN last_shield_reset_at TIMESTAMP NULL"))
+                if 'day_end_time_local' not in profile_cols:
+                    conn.execute(text("ALTER TABLE profiles ADD COLUMN day_end_time_local VARCHAR DEFAULT '21:30'"))
                 conn.commit()
             
+            # Mission: is_recovery, duration_minutes
             if inspector.has_table('missions'):
                 mission_cols = [c['name'] for c in inspector.get_columns('missions')]
                 if 'is_recovery' not in mission_cols:
@@ -36,12 +39,15 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE missions ADD COLUMN duration_minutes INTEGER NULL"))
                 conn.commit()
             
+            # MissionAssignment: used_streak_shield, plan_run_id
             if inspector.has_table('mission_assignments'):
                 assign_cols = [c['name'] for c in inspector.get_columns('mission_assignments')]
                 if 'used_streak_shield' not in assign_cols:
                     conn.execute(text("ALTER TABLE mission_assignments ADD COLUMN used_streak_shield BOOLEAN DEFAULT FALSE"))
+                if 'plan_run_id' not in assign_cols:
+                    conn.execute(text("ALTER TABLE mission_assignments ADD COLUMN plan_run_id INTEGER"))
                 conn.commit()
-    except Exception:
+    except Exception as e:
         # Schema migration failed silently - tables might be new or DB unavailable
         pass
 

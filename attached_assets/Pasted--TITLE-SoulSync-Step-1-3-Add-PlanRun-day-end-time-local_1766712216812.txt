@@ -1,0 +1,61 @@
+
+TITLE: SoulSync — Step 1/3: Add PlanRun + day_end_time_local + schema/idempotency scaffolding (NO AI planning yet)
+
+GLOBAL STACK LOCK (NON‑NEGOTIABLE)
+- Streamlit multipage ONLY (app.py + pages/). No Flask/FastAPI/Django/Node/React/Docker.
+- Postgres via SQLAlchemy using DATABASE_URL.
+- Do not remove existing fallbacks (AI offline banner, DB fallback behavior).
+- Do not add new dependencies.
+
+GOAL
+Implement DB/schema foundations needed for AI planning and swaps:
+1) Add PlanRun table for plan versioning and swap tracking.
+2) Add Profile.day_end_time_local (HH:MM string), default "21:30".
+3) Add plan_run_id on MissionAssignment to link assignments to PlanRun.
+4) Add minimal idempotency helpers and “ensure_schema” style migration logic if you don’t already have migrations.
+
+SCOPE (DO ONLY THIS)
+- NO Gemini calls.
+- NO mission generation logic changes except linking to PlanRun if needed.
+- NO UI changes except Settings field for day_end_time_local and optionally a “time left today” display stub.
+
+DB CHANGES (SQLAlchemy models.py)
+Add:
+- PlanRun:
+  - id (PK)
+  - user_id (FK -> User.id)
+  - date (DATE or string consistently with existing MissionAssignment.date usage)
+  - plan_version (int, default 1)
+  - source (string or Enum: journal, voice, missions_page)
+  - kind (string or Enum: full_plan, swap)
+  - status (string or Enum: previewed, assigned, superseded, cancelled)
+  - created_at
+  - meta_json (JSON/text)
+- Profile: add day_end_time_local (string "HH:MM", default "21:30")
+- MissionAssignment: add plan_run_id (FK -> PlanRun.id, nullable)
+
+SCHEMA MIGRATION STRATEGY
+- If project has no migrations, implement an idempotent ensure_schema() that:
+  - creates missing tables
+  - adds missing columns safely
+  - uses SQLAlchemy inspect + ALTER TABLE where needed
+- ensure_schema() must run once on app start (e.g., db init) and must not crash if columns already exist.
+
+UI (minimal)
+- Update pages/5_Settings.py:
+  - Add a “My day ends at” time input (default 21:30).
+  - Save to Profile.day_end_time_local.
+  - Explain: “Used to keep plans and swaps realistic: after this time, only wind-down missions are suggested.”
+
+ACCEPTANCE
+- Running app doesn’t break existing flows.
+- DB creates new PlanRun table and adds columns without error.
+- Settings updates persist day_end_time_local.
+
+DELIVERABLES
+- Updated soulsync/models.py
+- Updated schema init (db.py or wherever engine/session created)
+- Updated pages/5_Settings.py
+
+IMPORTANT:
+Implement only what is described. Do not refactor unrelated files. Do not introduce new frameworks or dependencies.

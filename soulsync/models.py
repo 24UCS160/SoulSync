@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime, ForeignKey, Text, Date
 from sqlalchemy.sql import func
 from .db import Base
 
@@ -24,6 +24,7 @@ class Profile(Base):
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     streak_shields_remaining = Column(Integer, default=2)
     last_shield_reset_at = Column(DateTime(timezone=True), nullable=True)
+    day_end_time_local = Column(String, default="21:30")
 
 class Stat(Base):
     __tablename__ = "stats"
@@ -58,6 +59,19 @@ class MissionAssignment(Base):
     proof_json = Column(JSON, nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     used_streak_shield = Column(Boolean, default=False)
+    plan_run_id = Column(Integer, ForeignKey("plan_runs.id"), nullable=True)
+
+class PlanRun(Base):
+    __tablename__ = "plan_runs"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    date = Column(String)
+    plan_version = Column(Integer, default=1)
+    source = Column(String)
+    kind = Column(String)
+    status = Column(String, default="previewed")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    meta_json = Column(JSON, default={})
 
 class VoiceMessage(Base):
     __tablename__ = "voice_messages"
