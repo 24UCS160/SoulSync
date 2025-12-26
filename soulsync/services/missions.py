@@ -662,3 +662,128 @@ Return ONLY valid JSON, no markdown:
     swap_json["swap_count"] = min(swap_json.get("swap_count", 0), swap_limit)
     
     return swap_json
+
+def validate_swap_plan(swap_json: dict, pending_missions: list, time_context: dict) -> tuple:
+    """
+    Validate swap JSON against all rules.
+    
+    Args:
+        swap_json: Output from propose_swaps()
+        pending_missions: List of pending missions (from get_pending_missions())
+        time_context: Output from compute_time_context()
+    
+    Returns:
+        (is_valid, error_list)
+    """
+    errors = []
+    
+    # Validate swap_json structure
+    if not swap_json or "swap_count" not in swap_json:
+        errors.append("Invalid swap JSON: missing swap_count")
+        return False, errors
+    
+    swap_count = swap_json.get("swap_count", 0)
+    replacements = swap_json.get("replacements", [])
+    no_swap_reason = swap_json.get("no_swap_reason", "")
+    
+    # Calculate swap_limit from time_context
+    after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
+    effective_mins = time_context.get("effective_mins_to_midnight" if after_bedtime else "effective_mins_to_bedtime", 0)
+    
+    if effective_mins < 15:
+        swap_limit = 1
+    elif effective_mins < 30:
+        swap_limit = 2
+    else:
+        swap_limit = 3
+    
+    # Validate swap_count
+    if swap_count < 0 or swap_count > 3:
+        errors.append(f"swap_count must be 0-3, got {swap_count}")
+    
+    if swap_count > swap_limit:
+        errors.append(f"swap_count {swap_count} exceeds time-based limit {swap_limit}")
+    
+    # Validate swap_count == 0 -> replacements empty and no_swap_reason present
+    if swap_count == 0:
+        if replacements:
+            errors.append("If swap_count==0, replacements must be empty")
+        if not no_swap_reason:
+            errors.append("If swap_count==0, no_swap_reason must be present")
+        # If swap_count=0, we're done
+        return len(errors) == 0, errors
+    
+    # Validate swap_count > 0 -> replacements must match
+    if len(replacements) != swap_count:
+        errors.append(f"swap_count={swap_count} but got {len(replacements)} replacements")
+    
+    # Get list of pending mission titles
+    pending_titles = [m["title"] for m in pending_missions]
+    replaced_titles = set()
+    
+    total_duration = 0
+    
+    for i, repl in enumerate(replacements):
+        replace_title = repl.get("replace_title", "")
+        new_mission = repl.get("new_mission", {})
+        
+        # Check replace_title exists
+        if replace_title not in pending_titles:
+            errors.append(f"Replacement {i}: replace_title '{replace_title}' not found in pending missions")
+        
+        # Check for duplicates
+        if replace_title in replaced_titles:
+            errors.append(f"Replacement {i}: duplicate replace_title '{replace_title}'")
+        replaced_titles.add(replace_title)
+        
+        # Validate new_mission
+        m_type = new_mission.get("type", "")
+        m_difficulty = new_mission.get("difficulty", "")
+        m_duration = new_mission.get("duration_minutes", 0)
+        m_xp = new_mission.get("xp_reward", 0)
+        micro = new_mission.get("micro", {})
+        title = new_mission.get("title", "")
+        
+        # Type check
+        if m_type not in ALLOWED_MISSION_TYPES:
+            errors.append(f"Replacement {i}: invalid type '{m_type}'")
+        
+        # After bedtime rules
+        if after_bedtime:
+            if m_type not in WIND_DOWN_TYPES:
+                errors.append(f"Replacement {i}: after bedtime, only reflection/sleep allowed, got '{m_type}'")
+            if m_difficulty != "easy":
+                errors.append(f"Replacement {i}: after bedtime, must be easy difficulty")
+            if m_duration > 15:
+                errors.append(f"Replacement {i}: after bedtime, max 15 minutes, got {m_duration}")
+        
+        # Duration and XP ranges
+        if m_duration < 5 or m_duration > 60:
+            errors.append(f"Replacement {i}: duration {m_duration} not in 5-60 range")
+        
+        if m_xp < 5 or m_xp > 60:
+            errors.append(f"Replacement {i}: xp {m_xp} not in 5-60 range")
+        
+        # Micro required and duration <= 5
+        if not micro or "title" not in micro:
+            errors.append(f"Replacement {i}: micro mission required")
+        elif micro.get("duration_minutes", 0) > 5:
+            errors.append(f"Replacement {i}: micro duration must be <= 5 mins")
+        
+        # Unsafe keywords
+        if any(kw in title.lower() for kw in UNSAFE_KEYWORDS):
+            errors.append(f"Replacement {i}: unsafe content in title")
+        
+        total_duration += m_duration
+    
+    # Time constraint check
+    if after_bedtime:
+        time_limit = time_context.get("effective_mins_to_midnight", 0)
+        if total_duration > time_limit:
+            errors.append(f"After bedtime: total replacement duration {total_duration} exceeds midnight limit {time_limit} mins")
+    else:
+        time_limit = time_context.get("effective_mins_to_bedtime", 0)
+        if total_duration > time_limit:
+            errors.append(f"Before bedtime: total replacement duration {total_duration} exceeds bedtime limit {time_limit} mins")
+    
+    return len(errors) == 0, errors
