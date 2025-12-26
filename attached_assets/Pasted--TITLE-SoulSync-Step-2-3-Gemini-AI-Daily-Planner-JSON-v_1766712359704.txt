@@ -1,0 +1,95 @@
+
+TITLE: SoulSync — Step 2/3: Gemini AI Daily Planner (JSON) + validation + daily new Mission creation (use existing missions.py)
+
+GLOBAL STACK LOCK
+- Streamlit multipage only.
+- Postgres SQLAlchemy DATABASE_URL.
+- Gemini via HTTP requests using requests (same style as soulsync/services/voice.py).
+- Preserve fallbacks: if GOOGLE_API_KEY missing/fails, planner uses deterministic fallback plan.
+- Do not add dependencies.
+
+ASSUMPTION
+PlanRun + Profile.day_end_time_local + MissionAssignment.plan_run_id exist from Step 1.
+
+GOAL
+Upgrade soulsync/services/missions.py to support Gemini-driven daily mission planning (full plan only):
+- Gemini generates a STRICT JSON plan.
+- App validates it.
+- On assign: create NEW Mission rows for today and MissionAssignments linked to a PlanRun(kind="full_plan", status="assigned").
+- Idempotent: if today’s plan already assigned and user didn’t click regenerate, do not duplicate.
+
+SCOPE
+- Implement FULL PLAN only (no swaps yet).
+- Wire only the Missions page button(s) to preview + assign the AI plan.
+- Keep existing hard-rule generator as fallback when Gemini fails or JSON invalid.
+
+IMPLEMENTATION DETAILS
+
+A) Add helper client (optional but recommended)
+- Create soulsync/services/gemini_client.py to centralize:
+  - POST request to Gemini generateContent endpoint
+  - generationConfig (temperature, maxOutputTokens)
+  - robust JSON extraction
+  - timeout
+- Reuse this client from missions.py (do NOT introduce new SDK).
+
+B) In soulsync/services/missions.py implement:
+1) compute_time_context(user_id, db):
+   - read Profile.day_end_time_local and timezone if available
+   - compute now_local, bedtime_cutoff_local, midnight_local
+   - compute mins_to_bedtime, mins_to_midnight
+   - buffer 15 min
+   - effective_mins_to_bedtime, effective_mins_to_midnight
+2) build_planner_context(user_id, date, minutes_cap, db, journal_signals_json=None, voice_intent_summary=None):
+   - include goals, streak, last 7 days completion summary
+   - include time_context
+3) generate_ai_plan_json(context) -> plan_json (JSON-only)
+   - Gemini planner prompt must return JSON only with schema:
+     {
+       "date":"YYYY-MM-DD",
+       "timezone":"Area/City",
+       "missions":[{ title,type,difficulty,duration_minutes,xp_reward,stat_targets,micro{title,duration_minutes,xp_reward},why_this }],
+       "notes":"..."
+     }
+   - generationConfig for planner: temperature 0.3, maxOutputTokens ~900
+4) validate_plan(plan_json, minutes_cap, time_context):
+   - 5–7 missions
+   - allowed types only: study, fitness, sleep, nutrition, reflection, social, chores
+   - total duration <= minutes_cap
+   - micro duration <= 5
+   - xp bounds
+   - no duplicate titles
+   - unsafe/adult keyword filter
+   - day-end rule enforcement:
+     - if effective_mins_to_bedtime == 0, restrict to reflection/sleep only and easy + <=15 minutes
+5) preview_plan(user_id, date, source, plan_json/meta, db):
+   - create PlanRun(kind="full_plan", status="previewed", plan_version = next version only if regenerate else current pending preview)
+   - store minutes_cap + time_context into meta_json
+6) assign_plan_creating_daily_missions(user_id, date, plan_json, plan_run, db):
+   - create NEW Mission rows for the date (created_for_date = date, created_by_system = true)
+   - include micro fields on Mission (micro_title, micro_duration_minutes, micro_xp_reward)
+   - create MissionAssignments(status=pending, plan_run_id=plan_run.id)
+   - set plan_run.status="assigned"
+   - supersede old assigned plan_run for same user/date if regenerate is requested; archive old pending assignments only
+
+C) Wire in pages/2_Missions.py
+- Add/modify:
+  - minutes_cap selector (default 45)
+  - “Generate AI Plan” button => calls preview (does not write Mission rows)
+  - Show plan preview (titles, durations, why_this, micro)
+  - “Assign this plan” button => calls assign_plan_creating_daily_missions
+  - Optional “Regenerate plan” button with max 1/day (use PlanRun meta_json counter)
+
+Fallback behavior (must keep)
+- If GOOGLE_API_KEY missing or Gemini fails/invalid JSON:
+  - use existing rule-based plan generator as fallback
+  - show banner “Planner used basic mode today.”
+
+ACCEPTANCE
+- Clicking Generate shows preview quickly.
+- Assign creates NEW Mission rows for today and assignments linked to PlanRun.
+- Rerunning app does not duplicate assigned plan.
+- After bedtime cutoff (effective_mins_to_bedtime==0), plan contains only reflection/sleep, easy, short.
+
+IMPORTANT:
+Implement only Step 2 items. Do not implement swaps yet. Do not refactor unrelated modules.

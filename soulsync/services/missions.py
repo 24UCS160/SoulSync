@@ -1,11 +1,394 @@
 from sqlalchemy.orm import Session
-from ..models import Mission, MissionAssignment
-from datetime import date
+from ..models import Mission, MissionAssignment, Profile, PlanRun, User
+from datetime import date, datetime, timedelta
 import json
+from .gemini_client import call_gemini_json
+
+ALLOWED_MISSION_TYPES = ["study", "fitness", "sleep", "nutrition", "reflection", "social", "chores"]
+WIND_DOWN_TYPES = ["reflection", "sleep"]
+ACTIVE_TYPES = ["study", "fitness", "chores", "social", "nutrition"]
+UNSAFE_KEYWORDS = ["adult", "violence", "sexual", "explicit"]
+
+def compute_time_context(user_id: int, db: Session) -> dict:
+    """
+    Compute time context for the user based on their day_end_time_local (UTC assumed).
+    
+    Returns:
+        {
+            "now_local": datetime str,
+            "bedtime_cutoff_local": datetime str,
+            "midnight_local": datetime str,
+            "mins_to_bedtime": int,
+            "mins_to_midnight": int,
+            "effective_mins_to_bedtime": int,
+            "effective_mins_to_midnight": int,
+            "buffer_minutes": int
+        }
+    """
+    profile = db.query(Profile).filter(Profile.user_id == user_id).first()
+    
+    # Get day end time (stored as HH:MM string)
+    day_end_str = profile.day_end_time_local if profile else "21:30"
+    try:
+        day_end_h, day_end_m = map(int, day_end_str.split(":"))
+    except:
+        day_end_h, day_end_m = 21, 30
+    
+    # Compute times (using local datetime without timezone library)
+    now_local = datetime.now()
+    bedtime_cutoff_local = now_local.replace(hour=day_end_h, minute=day_end_m, second=0, microsecond=0)
+    midnight_local = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+    
+    buffer_minutes = 15
+    
+    mins_to_bedtime = max(0, int((bedtime_cutoff_local - now_local).total_seconds() / 60))
+    mins_to_midnight = max(0, int((midnight_local - now_local).total_seconds() / 60))
+    
+    effective_mins_to_bedtime = max(0, mins_to_bedtime - buffer_minutes)
+    effective_mins_to_midnight = max(0, mins_to_midnight - buffer_minutes)
+    
+    return {
+        "now_local": now_local.isoformat(),
+        "bedtime_cutoff_local": bedtime_cutoff_local.isoformat(),
+        "midnight_local": midnight_local.isoformat(),
+        "mins_to_bedtime": mins_to_bedtime,
+        "mins_to_midnight": mins_to_midnight,
+        "effective_mins_to_bedtime": effective_mins_to_bedtime,
+        "effective_mins_to_midnight": effective_mins_to_midnight,
+        "buffer_minutes": buffer_minutes
+    }
+
+def build_planner_context(user_id: int, date_str: str, minutes_cap: int, db: Session, 
+                         journal_signals_json: dict = None, voice_intent_summary: str = None) -> dict:
+    """
+    Build full context for AI planner.
+    
+    Args:
+        user_id: User ID
+        date_str: YYYY-MM-DD
+        minutes_cap: Max total minutes for the day
+        db: Database session
+        journal_signals_json: Optional journal signals
+        voice_intent_summary: Optional voice intent
+    
+    Returns:
+        Context dict for Gemini prompt
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    profile = db.query(Profile).filter(Profile.user_id == user_id).first()
+    
+    time_context = compute_time_context(user_id, db)
+    
+    # Get streak and last 7 days completions
+    today_date = date.fromisoformat(date_str)
+    week_ago = today_date - timedelta(days=7)
+    
+    last_7_assignments = db.query(MissionAssignment).filter(
+        MissionAssignment.user_id == user_id,
+        MissionAssignment.date >= week_ago.isoformat(),
+        MissionAssignment.status == "completed"
+    ).count()
+    
+    streak = profile.streak_count if profile else 0
+    
+    # Build context
+    context = {
+        "user_handle": user.handle if user else "Student",
+        "goals_json": profile.goals_json if profile else {},
+        "streak_count": streak,
+        "last_7_days_completed": last_7_assignments,
+        "minutes_cap": minutes_cap,
+        "time_context": time_context,
+        "journal_signals": journal_signals_json or {},
+        "voice_intent": voice_intent_summary or ""
+    }
+    
+    return context
+
+def generate_ai_plan_json(context: dict) -> dict:
+    """
+    Call Gemini to generate daily plan JSON.
+    
+    Args:
+        context: Output from build_planner_context
+    
+    Returns:
+        Parsed plan JSON (or empty dict if failed)
+    """
+    time_ctx = context.get("time_context", {})
+    after_bedtime = time_ctx.get("effective_mins_to_bedtime", 0) == 0
+    
+    prompt = f"""You are a student life RPG mission planner. Generate a JSON plan for today.
+
+User: {context.get('user_handle')}
+Current Streak: {context.get('streak_count')} days
+Last 7 days completed: {context.get('last_7_days_completed')} missions
+Minutes available today: {context.get('minutes_cap')}
+
+Time context:
+- Time to bedtime cutoff: {time_ctx.get('effective_mins_to_bedtime', 0)} mins
+- Time to midnight: {time_ctx.get('effective_mins_to_midnight', 0)} mins
+- After bedtime cutoff: {after_bedtime}
+
+Journal signals (if any): {json.dumps(context.get('journal_signals', {}))}
+Voice intent (if any): {context.get('voice_intent', '')}
+
+STRICT RULES:
+1. Generate 5-7 missions
+2. Types ONLY: study, fitness, sleep, nutrition, reflection, social, chores
+3. Difficulties: easy, medium, hard
+4. Duration: 5-60 minutes each
+5. XP: 5-60 per mission
+6. Total duration <= {context.get('minutes_cap')} minutes
+7. Include at least one micro mission (<=5 mins)
+8. Each mission needs stat_targets array
+9. NO profanity or adult content
+
+AFTER BEDTIME ({after_bedtime}):
+- If true: ONLY reflection/sleep missions allowed
+- If true: ALL must be easy difficulty
+- If true: ALL must be <=15 minutes
+- If true: Prefer micro missions
+
+Return ONLY valid JSON, no markdown:
+{{
+  "date": "YYYY-MM-DD",
+  "timezone": "Area/City",
+  "missions": [
+    {{
+      "title": "mission title",
+      "type": "study|fitness|sleep|nutrition|reflection|social|chores",
+      "difficulty": "easy|medium|hard",
+      "duration_minutes": 5-60,
+      "xp_reward": 5-60,
+      "stat_targets": ["knowledge", "guts", "proficiency", "kindness", "charm"],
+      "micro": {{"title": "short title", "duration_minutes": 1-5, "xp_reward": 3-15}},
+      "why_this": "one sentence why"
+    }}
+  ],
+  "notes": "brief note"
+}}"""
+    
+    return call_gemini_json(prompt, temperature=0.3, max_tokens=900)
+
+def validate_plan(plan_json: dict, minutes_cap: int, time_context: dict) -> tuple:
+    """
+    Validate plan JSON against rules.
+    
+    Returns:
+        (is_valid, error_list)
+    """
+    errors = []
+    
+    if not plan_json or "missions" not in plan_json:
+        errors.append("Invalid plan JSON structure")
+        return False, errors
+    
+    missions = plan_json.get("missions", [])
+    
+    # Check count
+    if len(missions) < 5 or len(missions) > 7:
+        errors.append(f"Must have 5-7 missions, got {len(missions)}")
+    
+    # Check types, duration, xp, duplicates
+    titles = set()
+    total_duration = 0
+    has_micro = False
+    
+    after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
+    
+    for i, mission in enumerate(missions):
+        title = mission.get("title", "")
+        mission_type = mission.get("type", "")
+        difficulty = mission.get("difficulty", "")
+        duration = mission.get("duration_minutes", 0)
+        xp = mission.get("xp_reward", 0)
+        
+        # Type check
+        if mission_type not in ALLOWED_MISSION_TYPES:
+            errors.append(f"Mission {i}: invalid type '{mission_type}'")
+        
+        # After bedtime rules
+        if after_bedtime:
+            if mission_type not in WIND_DOWN_TYPES:
+                errors.append(f"Mission {i}: after bedtime, only reflection/sleep allowed, got '{mission_type}'")
+            if difficulty != "easy":
+                errors.append(f"Mission {i}: after bedtime, must be easy difficulty")
+            if duration > 15:
+                errors.append(f"Mission {i}: after bedtime, max 15 minutes, got {duration}")
+        
+        # Duration and XP
+        if duration < 5 or duration > 60:
+            errors.append(f"Mission {i}: duration {duration} not in 5-60 range")
+        
+        if xp < 5 or xp > 60:
+            errors.append(f"Mission {i}: xp {xp} not in 5-60 range")
+        
+        # Micro check
+        micro = mission.get("micro", {})
+        if micro and micro.get("duration_minutes", 0) <= 5:
+            has_micro = True
+        
+        # Duplicates
+        if title in titles:
+            errors.append(f"Mission {i}: duplicate title '{title}'")
+        titles.add(title)
+        
+        # Unsafe keywords
+        if any(kw in title.lower() for kw in UNSAFE_KEYWORDS):
+            errors.append(f"Mission {i}: unsafe content in title")
+        
+        total_duration += duration
+    
+    # Total duration
+    if total_duration > minutes_cap:
+        errors.append(f"Total duration {total_duration} exceeds cap {minutes_cap}")
+    
+    if not has_micro:
+        errors.append("Must include at least one micro mission (<=5 mins)")
+    
+    return len(errors) == 0, errors
+
+def preview_plan(user_id: int, date_str: str, source: str, plan_json: dict, time_context: dict, 
+                 minutes_cap: int, db: Session) -> tuple:
+    """
+    Create a PlanRun with status=previewed.
+    
+    Args:
+        user_id: User ID
+        date_str: YYYY-MM-DD
+        source: "missions_page", "journal", or "voice"
+        plan_json: Validated plan JSON
+        time_context: Time context dict
+        minutes_cap: Minutes cap
+        db: Database session
+    
+    Returns:
+        (PlanRun object, plan_json)
+    """
+    # Check if already have assigned plan for today
+    existing_assigned = db.query(PlanRun).filter(
+        PlanRun.user_id == user_id,
+        PlanRun.date == date_str,
+        PlanRun.kind == "full_plan",
+        PlanRun.status == "assigned"
+    ).first()
+    
+    plan_version = 1
+    if existing_assigned:
+        plan_version = existing_assigned.plan_version + 1
+    
+    plan_run = PlanRun(
+        user_id=user_id,
+        date=date_str,
+        plan_version=plan_version,
+        source=source,
+        kind="full_plan",
+        status="previewed",
+        meta_json={
+            "minutes_cap": minutes_cap,
+            "time_context": time_context,
+            "plan_json": plan_json
+        }
+    )
+    
+    db.add(plan_run)
+    db.commit()
+    db.refresh(plan_run)
+    
+    return plan_run, plan_json
+
+def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: PlanRun, db: Session) -> bool:
+    """
+    Assign plan: create NEW Mission rows and MissionAssignments.
+    
+    Idempotency: if plan already assigned, return False.
+    
+    Args:
+        user_id: User ID
+        date_str: YYYY-MM-DD
+        plan_run: PlanRun object (status should be "previewed")
+        db: Database session
+    
+    Returns:
+        True if successful, False if idempotent (already assigned)
+    """
+    # Check if already assigned today
+    existing_assigned = db.query(PlanRun).filter(
+        PlanRun.user_id == user_id,
+        PlanRun.date == date_str,
+        PlanRun.kind == "full_plan",
+        PlanRun.status == "assigned"
+    ).all()
+    
+    # If this plan_run is already assigned, skip
+    if plan_run.status == "assigned":
+        return False
+    
+    # If there are other assigned plans from earlier version, supersede them
+    for old_plan in existing_assigned:
+        if old_plan.id != plan_run.id:
+            old_plan.status = "superseded"
+            # Archive old assignments
+            old_assigns = db.query(MissionAssignment).filter(
+                MissionAssignment.user_id == user_id,
+                MissionAssignment.date == date_str,
+                MissionAssignment.plan_run_id == old_plan.id,
+                MissionAssignment.status == "pending"
+            ).all()
+            for assign in old_assigns:
+                assign.status = "archived"
+    
+    # Create new missions from plan_json
+    plan_json = plan_run.meta_json.get("plan_json", {})
+    missions_data = plan_json.get("missions", [])
+    
+    for mission_data in missions_data:
+        mission = Mission(
+            title=mission_data.get("title", ""),
+            type=mission_data.get("type", ""),
+            difficulty=mission_data.get("difficulty", "easy"),
+            xp_reward=mission_data.get("xp_reward", 10),
+            duration_minutes=mission_data.get("duration_minutes", 30),
+            created_for_date=date_str,
+            created_by_system=True
+        )
+        
+        # Store micro and why_this in geo_rule_json
+        micro = mission_data.get("micro", {})
+        why_this = mission_data.get("why_this", "")
+        mission.geo_rule_json = {
+            "why": why_this,
+            "micro_title": micro.get("title", ""),
+            "micro_duration_minutes": micro.get("duration_minutes", 0),
+            "micro_xp_reward": micro.get("xp_reward", 0)
+        }
+        
+        db.add(mission)
+        db.commit()
+        db.refresh(mission)
+        
+        # Create assignment
+        assign = MissionAssignment(
+            user_id=user_id,
+            mission_id=mission.id,
+            date=date_str,
+            status="pending",
+            plan_run_id=plan_run.id
+        )
+        db.add(assign)
+    
+    # Update plan_run status
+    plan_run.status = "assigned"
+    db.commit()
+    
+    return True
+
+# Existing functions
 
 def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
+    """Legacy function - kept for backward compatibility."""
     today = date.today().isoformat()
-    # Check if already generated
     existing = db.query(MissionAssignment).filter(
         MissionAssignment.user_id == user_id,
         MissionAssignment.date == today
@@ -15,48 +398,41 @@ def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
 
     missions = []
     
-    # 1. Sleep
     sleep = float(journal_metrics.get("sleep_hours", 0) or 0)
     if sleep < 7:
         missions.append({
             "title": "Power Nap or Early Bedtime",
-            "type": "Health",
+            "type": "sleep",
             "xp_reward": 20,
             "geo_rule_json": {"why": "You slept less than 7 hours."}
         })
     
-    # 2. Study
     study = int(journal_metrics.get("study_minutes", 0) or 0)
     if study < 30:
         missions.append({
             "title": "Focus Session: 25 mins",
-            "type": "Knowledge",
+            "type": "study",
             "xp_reward": 30,
             "geo_rule_json": {"why": "Daily study goal not met."}
         })
 
-    # 3. Reflection (Always)
     missions.append({
         "title": "Evening Reflection",
-        "type": "Kindness",
+        "type": "reflection",
         "xp_reward": 15,
         "geo_rule_json": {"why": "Daily mindfulness."}
     })
 
-    # 4. Movement
     move = int(journal_metrics.get("movement_minutes", 0) or 0)
     if move < 15:
         missions.append({
             "title": "Quick Walk or Stretch",
-            "type": "Guts",
+            "type": "fitness",
             "xp_reward": 20,
             "geo_rule_json": {"why": "Movement goal not met."}
         })
 
     for m_data in missions:
-        # Create Mission (or find existing template)
-        # For MVP we create new mission rows or reuse if we had a catalog.
-        # Here we just create new ones to be simple.
         mission = Mission(
             title=m_data["title"],
             type=m_data["type"],
@@ -68,7 +444,6 @@ def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
         db.commit()
         db.refresh(mission)
 
-        # Assign
         assign = MissionAssignment(
             user_id=user_id,
             mission_id=mission.id,
@@ -79,6 +454,7 @@ def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
     db.commit()
 
 def get_todays_missions(user_id: int, db: Session):
+    """Get all missions assigned for today."""
     today = date.today().isoformat()
     return db.query(MissionAssignment).filter(
         MissionAssignment.user_id == user_id, 
@@ -86,15 +462,23 @@ def get_todays_missions(user_id: int, db: Session):
     ).all()
 
 def complete_mission(assignment_id: int, db: Session):
+    """Complete a mission assignment."""
     assign = db.query(MissionAssignment).filter(MissionAssignment.id == assignment_id).first()
     if assign and assign.status != "completed":
         assign.status = "completed"
-        # Add XP
+        assign.completed_at = datetime.now()
         mission = db.query(Mission).filter(Mission.id == assign.mission_id).first()
         if mission:
             from .stats import add_xp
-            # Map type to stat
-            stat_map = {"Health": "Guts", "Knowledge": "Knowledge", "Kindness": "Kindness"}
+            stat_map = {
+                "study": "Knowledge",
+                "fitness": "Guts",
+                "reflection": "Proficiency",
+                "sleep": "Kindness",
+                "nutrition": "Charm",
+                "social": "Charm",
+                "chores": "Guts"
+            }
             stat_type = stat_map.get(mission.type, "Proficiency")
             add_xp(assign.user_id, stat_type, mission.xp_reward, db)
         db.commit()
