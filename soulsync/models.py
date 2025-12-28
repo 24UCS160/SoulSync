@@ -60,6 +60,7 @@ class MissionAssignment(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     used_streak_shield = Column(Boolean, default=False)
     plan_run_id = Column(Integer, ForeignKey("plan_runs.id"), nullable=True)
+    earned_xp = Column(Integer, nullable=True)
 
 class PlanRun(Base):
     __tablename__ = "plan_runs"
