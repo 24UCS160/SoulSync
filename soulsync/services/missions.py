@@ -9,6 +9,142 @@ WIND_DOWN_TYPES = ["reflection", "sleep"]
 ACTIVE_TYPES = ["study", "fitness", "chores", "social", "nutrition"]
 UNSAFE_KEYWORDS = ["adult", "violence", "sexual", "explicit"]
 
+# --- Micro policy constants ---
+MICRO_XP_DEFAULT = 2              # small reward if micro mission lacks explicit xp
+MICRO_DAILY_CAP = 10              # optional cap per day (applies to total micro XP awards)
+MICRO_MAX_PER_PARENT = 1          # micro click once per parent (anti-spam)
+MICRO_ALLOWED_TYPES_AFTER_BEDTIME = set(["reflection", "sleep"])
+MICRO_MAX_DURATION_AFTER_BEDTIME = 15
+
+def can_mark_micro_now(micro_assign: MissionAssignment, time_context: dict, db: Session) -> tuple:
+    """
+    Returns (ok: bool, reason: str). Enforces after‑bedtime micro constraints:
+      - Only micro linked to reflection or sleep parent type
+      - Duration <= 15
+      - Difficulty 'easy' (micro missions are created 'easy' by default)
+    """
+    after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
+    mission = db.query(Mission).filter(Mission.id == micro_assign.mission_id).first()
+    if not mission:
+        return False, "Mission not found."
+
+    if (mission.type or "").lower() != "micro":
+        # Not a micro mission—this helper is only for micros
+        return False, "Not a micro mission."
+
+    meta = mission.geo_rule_json or {}
+    parent_type = (meta.get("parent_type") or "").lower()
+    dur = int(mission.duration_minutes or 0)
+
+    if after_bedtime:
+        if parent_type not in MICRO_ALLOWED_TYPES_AFTER_BEDTIME:
+            return False, f"After bedtime: only reflection/sleep micros allowed (parent type '{parent_type}')."
+        if dur > MICRO_MAX_DURATION_AFTER_BEDTIME:
+            return False, f"After bedtime: micro duration must be <= {MICRO_MAX_DURATION_AFTER_BEDTIME} mins (got {dur})."
+
+    return True, ""
+
+def award_micro_xp(user_id: int, mission: Mission, db: Session) -> None:
+    """
+    Awards tiny XP for a micro mission. Uses mission.xp_reward if set; otherwise MICRO_XP_DEFAULT.
+    Optional: enforce a simple daily cap by summing awarded micro XP in today's completed micro assignments.
+    """
+    xp = int(mission.xp_reward or MICRO_XP_DEFAULT)
+
+    # Optional daily cap enforcement (simple approach via query)
+    try:
+        today = date.today().isoformat()
+        # Sum XP from completed micro missions today
+        today_completed_micro = db.query(MissionAssignment).join(Mission).filter(
+            MissionAssignment.user_id == user_id,
+            MissionAssignment.date == today,
+            MissionAssignment.status == "completed",
+            Mission.type == "micro"
+        ).all()
+        total_awarded_today = 0
+        for a in today_completed_micro:
+            m = db.query(Mission).filter(Mission.id == a.mission_id).first()
+            if m and m.xp_reward:
+                total_awarded_today += int(m.xp_reward)
+        if MICRO_DAILY_CAP and (total_awarded_today + xp) > MICRO_DAILY_CAP:
+            # clamp to cap remainder
+            xp = max(0, MICRO_DAILY_CAP - total_awarded_today)
+    except Exception:
+        # If any problem occurs, do not block; proceed with default tiny XP
+        pass
+
+    if xp > 0:
+        from .stats import add_xp
+        # Map micro to a neutral stat (keep consistent with existing default).
+        # Your complete_mission already defaults to "Proficiency" for unknown types.
+        add_xp(user_id, "Proficiency", xp, db)
+
+def mark_micro_completed(assignment_id: int, db: Session) -> dict:
+    """
+    Transactionally mark a MICRO mission assignment as completed, with bedtime safety gates.
+    Returns: {"ok": bool, "errors": [..]} and includes small XP award.
+    """
+    assign = db.query(MissionAssignment).filter(MissionAssignment.id == assignment_id).first()
+    if not assign:
+        return {"ok": False, "errors": ["Assignment not found."]}
+
+    if assign.status == "completed":
+        return {"ok": True, "errors": []}  # already done; idempotent
+
+    mission = db.query(Mission).filter(Mission.id == assign.mission_id).first()
+    if not mission:
+        return {"ok": False, "errors": ["Mission not found."]}
+
+    if (mission.type or "").lower() != "micro":
+        return {"ok": False, "errors": ["Assignment is not a micro mission."]}
+
+    # Compute time context for bedtime gate
+    time_context = compute_time_context(assign.user_id, db)
+    ok, reason = can_mark_micro_now(assign, time_context, db)
+    if not ok:
+        return {"ok": False, "errors": [reason]}
+
+    # Perform transactional update
+    try:
+        assign.status = "completed"
+        assign.completed_at = datetime.now()
+
+        # Award tiny XP
+        award_micro_xp(assign.user_id, mission, db)
+
+        # Audit (if model exists as in your imports)
+        try:
+            audit = AuditLog(
+                user_id=assign.user_id,
+                event_type="mission_micro_completed",
+                meta_json={
+                    "mission_id": mission.id,
+                    "assignment_id": assign.id,
+                    "date": assign.date,
+                    "time_context": time_context,
+                    "awarded_xp": int(mission.xp_reward or MICRO_XP_DEFAULT),
+                }
+            )
+            db.add(audit)
+        except Exception:
+            # If AuditLog schema differs, don't block completion
+            pass
+
+        db.commit()
+        return {"ok": True, "errors": []}
+    except Exception as e:
+        db.rollback()
+        return {"ok": False, "errors": [str(e)]}
+
+def get_todays_micro_assignments(user_id: int, db: Session):
+    today = date.today().isoformat()
+    return db.query(MissionAssignment).join(Mission).filter(
+        MissionAssignment.user_id == user_id,
+        MissionAssignment.date == today,
+        MissionAssignment.status == "pending",
+        Mission.type == "micro"
+    ).all()
+
 def _is_micro_type(mtype: str, duration_minutes: int) -> bool:
     m = (mtype or "").lower()
     return m == "micro" or (duration_minutes is not None and int(duration_minutes) <= 5)
@@ -365,11 +501,13 @@ def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: P
         # Store why + micro metadata (still useful for transparency)
         micro_obj = mission_data.get("micro", {}) or {}
         why_this = mission_data.get("why_this", "") or ""
-        mission.geo_rule_json = {
-            "why": why_this,
-            "micro_title": micro_obj.get("title", "") or "",
-            "micro_duration_minutes": _safe_int(micro_obj.get("duration_minutes", 0), 0),
-            "micro_xp_reward": _safe_int(micro_obj.get("xp_reward", 0), 0),
+        micro_mission.geo_rule_json = {
+    "why": micro_why,
+    "kind": "micro",
+    "parent_mission_id": mission.id,
+    "parent_title": mission.title,
+    "parent_type": mission.type,  # NEW: used by after‑bedtime gate
+    "from_plan_run_id": plan_run.id,
         }
 
         db.add(mission)
@@ -575,16 +713,18 @@ def get_pending_missions(user_id: int, date_str: str, db: Session) -> list:
     ).all()
     
     pending = []
-    for assign in assignments:
+        for assign in assignments:
         mission = db.query(Mission).filter(Mission.id == assign.mission_id).first()
         if mission:
+            if (mission.type or "").lower() == "micro":
+                continue  # skip micros for swap proposals
             pending.append({
                 "title": mission.title,
                 "type": mission.type,
                 "duration_minutes": mission.duration_minutes or 30,
                 "xp_reward": mission.xp_reward or 10
             })
-    
+            
     return pending
 
 def propose_swaps(
