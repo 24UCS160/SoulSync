@@ -9,6 +9,10 @@ WIND_DOWN_TYPES = ["reflection", "sleep"]
 ACTIVE_TYPES = ["study", "fitness", "chores", "social", "nutrition"]
 UNSAFE_KEYWORDS = ["adult", "violence", "sexual", "explicit"]
 
+def _is_micro_type(mtype: str, duration_minutes: int) -> bool:
+    m = (mtype or "").lower()
+    return m == "micro" or (duration_minutes is not None and int(duration_minutes) <= 5)
+
 def compute_time_context(user_id: int, db: Session) -> dict:
     """
     Compute time context for the user based on their day_end_time_local (UTC assumed).
