@@ -304,88 +304,155 @@ def preview_plan(user_id: int, date_str: str, source: str, plan_json: dict, time
 
 def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: PlanRun, db: Session) -> bool:
     """
-    Assign plan: create NEW Mission rows and MissionAssignments.
-    
-    Idempotency: if plan already assigned, return False.
-    
-    Args:
-        user_id: User ID
-        date_str: YYYY-MM-DD
-        plan_run: PlanRun object (status should be "previewed")
-        db: Database session
-    
-    Returns:
-        True if successful, False if idempotent (already assigned)
+    Assign plan: create NEW Mission rows + MissionAssignments.
+    Also creates separate MICRO mission+assignment when mission_data contains a 'micro' object.
+
+    Idempotency:
+      - If plan_run already assigned, return False.
+      - Supersedes older assigned plans for the same day (archives pending assignments).
     """
-    # Check if already assigned today
+    # Check if already assigned today (existing behavior)
     existing_assigned = db.query(PlanRun).filter(
         PlanRun.user_id == user_id,
         PlanRun.date == date_str,
         PlanRun.kind == "full_plan",
         PlanRun.status == "assigned"
     ).all()
-    
+
     # If this plan_run is already assigned, skip
     if plan_run.status == "assigned":
         return False
-    
-    # If there are other assigned plans from earlier version, supersede them
+
+    # Supersede earlier assigned plans (archive their pending assignments)
     for old_plan in existing_assigned:
         if old_plan.id != plan_run.id:
             old_plan.status = "superseded"
-            # Archive old assignments
             old_assigns = db.query(MissionAssignment).filter(
                 MissionAssignment.user_id == user_id,
                 MissionAssignment.date == date_str,
                 MissionAssignment.plan_run_id == old_plan.id,
                 MissionAssignment.status == "pending"
             ).all()
-            for assign in old_assigns:
-                assign.status = "archived"
-    
-    # Create new missions from plan_json
-    plan_json = plan_run.meta_json.get("plan_json", {})
-    missions_data = plan_json.get("missions", [])
-    
+            for a in old_assigns:
+                a.status = "archived"
+
+    # Create missions from plan_json
+    plan_json = (plan_run.meta_json or {}).get("plan_json", {})
+    missions_data = plan_json.get("missions", []) or []
+
+    # Helper: normalize micro minutes/xp safely
+    def _safe_int(x, default):
+        try:
+            return int(x)
+        except Exception:
+            return default
+
+    created_count = 0
+    created_micro_count = 0
+
     for mission_data in missions_data:
+        # 1) Create MAIN mission
         mission = Mission(
-            title=mission_data.get("title", ""),
-            type=mission_data.get("type", ""),
-            difficulty=mission_data.get("difficulty", "easy"),
-            xp_reward=mission_data.get("xp_reward", 10),
-            duration_minutes=mission_data.get("duration_minutes", 30),
+            title=mission_data.get("title", "") or "",
+            type=mission_data.get("type", "") or "",
+            difficulty=mission_data.get("difficulty", "easy") or "easy",
+            xp_reward=_safe_int(mission_data.get("xp_reward", 10), 10),
+            duration_minutes=_safe_int(mission_data.get("duration_minutes", 30), 30),
             created_for_date=date_str,
-            created_by_system=True
+            created_by_system=True,
         )
-        
-        # Store micro and why_this in geo_rule_json
-        micro = mission_data.get("micro", {})
-        why_this = mission_data.get("why_this", "")
+
+        # Store why + micro metadata (still useful for transparency)
+        micro_obj = mission_data.get("micro", {}) or {}
+        why_this = mission_data.get("why_this", "") or ""
         mission.geo_rule_json = {
             "why": why_this,
-            "micro_title": micro.get("title", ""),
-            "micro_duration_minutes": micro.get("duration_minutes", 0),
-            "micro_xp_reward": micro.get("xp_reward", 0)
+            "micro_title": micro_obj.get("title", "") or "",
+            "micro_duration_minutes": _safe_int(micro_obj.get("duration_minutes", 0), 0),
+            "micro_xp_reward": _safe_int(micro_obj.get("xp_reward", 0), 0),
         }
-        
+
         db.add(mission)
-        db.commit()
-        db.refresh(mission)
-        
-        # Create assignment
+        db.flush()  # get mission.id without committing
+
+        # 2) Create MAIN assignment
         assign = MissionAssignment(
             user_id=user_id,
             mission_id=mission.id,
             date=date_str,
             status="pending",
-            plan_run_id=plan_run.id
+            plan_run_id=plan_run.id,
         )
+        # Optional but nice: proof_json marker
+        if hasattr(assign, "proof_json"):
+            assign.proof_json = {"source": "plan_main", "plan_run_id": plan_run.id}
+
         db.add(assign)
-    
-    # Update plan_run status
+
+        created_count += 1
+
+        # 3) Create MICRO mission + assignment (NEW FEATURE B core)
+        if micro_obj and (micro_obj.get("title") or "").strip():
+            micro_minutes = _safe_int(micro_obj.get("duration_minutes", 3), 3)
+            micro_xp = _safe_int(micro_obj.get("xp_reward", 5), 5)
+
+            micro_mission = Mission(
+                title=f"🟣 {micro_obj.get('title','').strip()}",
+                type="micro",
+                difficulty="easy",
+                xp_reward=micro_xp,
+                duration_minutes=micro_minutes,
+                created_for_date=date_str,
+                created_by_system=True,
+            )
+
+            micro_why = micro_obj.get("why_this", "") or ""
+            micro_mission.geo_rule_json = {
+                "why": micro_why,
+                "kind": "micro",
+                "parent_mission_id": mission.id,
+                "parent_title": mission.title,
+                "from_plan_run_id": plan_run.id,
+            }
+
+            db.add(micro_mission)
+            db.flush()
+
+            micro_assign = MissionAssignment(
+                user_id=user_id,
+                mission_id=micro_mission.id,
+                date=date_str,
+                status="pending",
+                plan_run_id=plan_run.id,
+            )
+            if hasattr(micro_assign, "proof_json"):
+                micro_assign.proof_json = {
+                    "source": "plan_micro",
+                    "parent_mission_id": mission.id,
+                    "parent_title": mission.title,
+                    "plan_run_id": plan_run.id,
+                }
+
+            db.add(micro_assign)
+            created_micro_count += 1
+
+    # Mark plan_run assigned
     plan_run.status = "assigned"
+
+    # Commit once
     db.commit()
-    
+
+    # Optional: store counts for debugging/audit visibility
+    try:
+        meta = plan_run.meta_json or {}
+        meta["created_missions_count"] = created_count
+        meta["created_micro_missions_count"] = created_micro_count
+        plan_run.meta_json = meta
+        db.commit()
+    except Exception:
+        # no need to fail assignment if meta_json update fails
+        db.rollback()
+
     return True
 
 # Existing functions
