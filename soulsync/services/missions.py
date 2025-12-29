@@ -16,9 +16,10 @@ MICRO_MAX_PER_PARENT = 1          # micro click once per parent (anti-spam)
 MICRO_ALLOWED_TYPES_AFTER_BEDTIME = set(["reflection", "sleep"])
 MICRO_MAX_DURATION_AFTER_BEDTIME = 15
 
+
 def can_mark_micro_now(micro_assign: MissionAssignment, time_context: dict, db: Session) -> tuple:
     """
-    Returns (ok: bool, reason: str). Enforces after‑bedtime micro constraints:
+    Returns (ok: bool, reason: str). Enforces after-bedtime micro constraints:
       - Only micro linked to reflection or sleep parent type
       - Duration <= 15
       - Difficulty 'easy' (micro missions are created 'easy' by default)
@@ -43,6 +44,7 @@ def can_mark_micro_now(micro_assign: MissionAssignment, time_context: dict, db: 
             return False, f"After bedtime: micro duration must be <= {MICRO_MAX_DURATION_AFTER_BEDTIME} mins (got {dur})."
 
     return True, ""
+
 
 def award_micro_xp(user_id: int, mission: Mission, db: Session) -> None:
     """
@@ -78,6 +80,7 @@ def award_micro_xp(user_id: int, mission: Mission, db: Session) -> None:
         # Map micro to a neutral stat (keep consistent with existing default).
         # Your complete_mission already defaults to "Proficiency" for unknown types.
         add_xp(user_id, "Proficiency", xp, db)
+
 
 def mark_micro_completed(assignment_id: int, db: Session) -> dict:
     """
@@ -136,6 +139,7 @@ def mark_micro_completed(assignment_id: int, db: Session) -> dict:
         db.rollback()
         return {"ok": False, "errors": [str(e)]}
 
+
 def get_todays_micro_assignments(user_id: int, db: Session):
     today = date.today().isoformat()
     return db.query(MissionAssignment).join(Mission).filter(
@@ -145,14 +149,16 @@ def get_todays_micro_assignments(user_id: int, db: Session):
         Mission.type == "micro"
     ).all()
 
+
 def _is_micro_type(mtype: str, duration_minutes: int) -> bool:
     m = (mtype or "").lower()
     return m == "micro" or (duration_minutes is not None and int(duration_minutes) <= 5)
 
+
 def compute_time_context(user_id: int, db: Session) -> dict:
     """
     Compute time context for the user based on their day_end_time_local (UTC assumed).
-    
+
     Returns:
         {
             "now_local": datetime str,
@@ -166,27 +172,27 @@ def compute_time_context(user_id: int, db: Session) -> dict:
         }
     """
     profile = db.query(Profile).filter(Profile.user_id == user_id).first()
-    
+
     # Get day end time (stored as HH:MM string)
     day_end_str = profile.day_end_time_local if profile else "21:30"
     try:
         day_end_h, day_end_m = map(int, day_end_str.split(":"))
-    except:
+    except Exception:
         day_end_h, day_end_m = 21, 30
-    
+
     # Compute times (using local datetime without timezone library)
     now_local = datetime.now()
     bedtime_cutoff_local = now_local.replace(hour=day_end_h, minute=day_end_m, second=0, microsecond=0)
     midnight_local = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
-    
+
     buffer_minutes = 15
-    
+
     mins_to_bedtime = max(0, int((bedtime_cutoff_local - now_local).total_seconds() / 60))
     mins_to_midnight = max(0, int((midnight_local - now_local).total_seconds() / 60))
-    
+
     effective_mins_to_bedtime = max(0, mins_to_bedtime - buffer_minutes)
     effective_mins_to_midnight = max(0, mins_to_midnight - buffer_minutes)
-    
+
     return {
         "now_local": now_local.isoformat(),
         "bedtime_cutoff_local": bedtime_cutoff_local.isoformat(),
@@ -198,11 +204,12 @@ def compute_time_context(user_id: int, db: Session) -> dict:
         "buffer_minutes": buffer_minutes
     }
 
-def build_planner_context(user_id: int, date_str: str, minutes_cap: int, db: Session, 
-                         journal_signals_json: dict = None, voice_intent_summary: str = None) -> dict:
+
+def build_planner_context(user_id: int, date_str: str, minutes_cap: int, db: Session,
+                          journal_signals_json: dict = None, voice_intent_summary: str = None) -> dict:
     """
     Build full context for AI planner.
-    
+
     Args:
         user_id: User ID
         date_str: YYYY-MM-DD
@@ -210,27 +217,27 @@ def build_planner_context(user_id: int, date_str: str, minutes_cap: int, db: Ses
         db: Database session
         journal_signals_json: Optional journal signals
         voice_intent_summary: Optional voice intent
-    
+
     Returns:
         Context dict for Gemini prompt
     """
     user = db.query(User).filter(User.id == user_id).first()
     profile = db.query(Profile).filter(Profile.user_id == user_id).first()
-    
+
     time_context = compute_time_context(user_id, db)
-    
+
     # Get streak and last 7 days completions
     today_date = date.fromisoformat(date_str)
     week_ago = today_date - timedelta(days=7)
-    
+
     last_7_assignments = db.query(MissionAssignment).filter(
         MissionAssignment.user_id == user_id,
         MissionAssignment.date >= week_ago.isoformat(),
         MissionAssignment.status == "completed"
     ).count()
-    
+
     streak = profile.streak_count if profile else 0
-    
+
     # Build context
     context = {
         "user_handle": user.handle if user else "Student",
@@ -242,22 +249,23 @@ def build_planner_context(user_id: int, date_str: str, minutes_cap: int, db: Ses
         "journal_signals": journal_signals_json or {},
         "voice_intent": voice_intent_summary or ""
     }
-    
+
     return context
+
 
 def generate_ai_plan_json(context: dict) -> dict:
     """
     Call Gemini to generate daily plan JSON.
-    
+
     Args:
         context: Output from build_planner_context
-    
+
     Returns:
         Parsed plan JSON (or empty dict if failed)
     """
     time_ctx = context.get("time_context", {})
     after_bedtime = time_ctx.get("effective_mins_to_bedtime", 0) == 0
-    
+
     prompt = f"""You are a student life RPG mission planner. Generate a JSON plan for today.
 
 User: {context.get('user_handle')}
@@ -291,63 +299,64 @@ AFTER BEDTIME ({after_bedtime}):
 - If true: Prefer micro missions
 
 Return ONLY valid JSON, no markdown:
-{{
+{
   "date": "YYYY-MM-DD",
   "timezone": "Area/City",
   "missions": [
-    {{
+    {
       "title": "mission title",
       "type": "study|fitness|sleep|nutrition|reflection|social|chores",
       "difficulty": "easy|medium|hard",
       "duration_minutes": 5-60,
       "xp_reward": 5-60,
       "stat_targets": ["knowledge", "guts", "proficiency", "kindness", "charm"],
-      "micro": {{"title": "short title", "duration_minutes": 1-5, "xp_reward": 3-15}},
+      "micro": {"title": "short title", "duration_minutes": 1-5, "xp_reward": 3-15},
       "why_this": "one sentence why"
-    }}
+    }
   ],
   "notes": "brief note"
-}}"""
-    
+}"""
+
     return call_gemini_json(prompt, temperature=0.3, max_tokens=900)
+
 
 def validate_plan(plan_json: dict, minutes_cap: int, time_context: dict) -> tuple:
     """
     Validate plan JSON against rules.
-    
+
     Returns:
         (is_valid, error_list)
     """
     errors = []
-    
+
     if not plan_json or "missions" not in plan_json:
         errors.append("Invalid plan JSON structure")
         return False, errors
-    
+
     missions = plan_json.get("missions", [])
-    
+
     # Check count
     if len(missions) < 5 or len(missions) > 7:
         errors.append(f"Must have 5-7 missions, got {len(missions)}")
-    
+
     # Check types, duration, xp, duplicates
     titles = set()
     total_duration = 0
     has_micro = False
-    
+
     after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
-    
+
     for i, mission in enumerate(missions):
         title = mission.get("title", "")
         mission_type = mission.get("type", "")
         difficulty = mission.get("difficulty", "")
         duration = mission.get("duration_minutes", 0)
         xp = mission.get("xp_reward", 0)
-        
+
         # Type check
         if mission_type not in ALLOWED_MISSION_TYPES:
             errors.append(f"Mission {i}: invalid type '{mission_type}'")
-        
+
         # After bedtime rules
         if after_bedtime:
             if mission_type not in WIND_DOWN_TYPES:
@@ -356,44 +365,45 @@ def validate_plan(plan_json: dict, minutes_cap: int, time_context: dict) -> tupl
                 errors.append(f"Mission {i}: after bedtime, must be easy difficulty")
             if duration > 15:
                 errors.append(f"Mission {i}: after bedtime, max 15 minutes, got {duration}")
-        
+
         # Duration and XP
         if duration < 5 or duration > 60:
             errors.append(f"Mission {i}: duration {duration} not in 5-60 range")
-        
+
         if xp < 5 or xp > 60:
             errors.append(f"Mission {i}: xp {xp} not in 5-60 range")
-        
+
         # Micro check
         micro = mission.get("micro", {})
         if micro and micro.get("duration_minutes", 0) <= 5:
             has_micro = True
-        
+
         # Duplicates
         if title in titles:
             errors.append(f"Mission {i}: duplicate title '{title}'")
         titles.add(title)
-        
+
         # Unsafe keywords
         if any(kw in title.lower() for kw in UNSAFE_KEYWORDS):
             errors.append(f"Mission {i}: unsafe content in title")
-        
+
         total_duration += duration
-    
+
     # Total duration
     if total_duration > minutes_cap:
         errors.append(f"Total duration {total_duration} exceeds cap {minutes_cap}")
-    
+
     if not has_micro:
         errors.append("Must include at least one micro mission (<=5 mins)")
-    
+
     return len(errors) == 0, errors
 
-def preview_plan(user_id: int, date_str: str, source: str, plan_json: dict, time_context: dict, 
+
+def preview_plan(user_id: int, date_str: str, source: str, plan_json: dict, time_context: dict,
                  minutes_cap: int, db: Session) -> tuple:
     """
     Create a PlanRun with status=previewed.
-    
+
     Args:
         user_id: User ID
         date_str: YYYY-MM-DD
@@ -402,7 +412,7 @@ def preview_plan(user_id: int, date_str: str, source: str, plan_json: dict, time
         time_context: Time context dict
         minutes_cap: Minutes cap
         db: Database session
-    
+
     Returns:
         (PlanRun object, plan_json)
     """
@@ -413,11 +423,11 @@ def preview_plan(user_id: int, date_str: str, source: str, plan_json: dict, time
         PlanRun.kind == "full_plan",
         PlanRun.status == "assigned"
     ).first()
-    
+
     plan_version = 1
     if existing_assigned:
         plan_version = existing_assigned.plan_version + 1
-    
+
     plan_run = PlanRun(
         user_id=user_id,
         date=date_str,
@@ -431,12 +441,13 @@ def preview_plan(user_id: int, date_str: str, source: str, plan_json: dict, time
             "plan_json": plan_json
         }
     )
-    
+
     db.add(plan_run)
     db.commit()
     db.refresh(plan_run)
-    
+
     return plan_run, plan_json
+
 
 def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: PlanRun, db: Session) -> bool:
     """
@@ -498,16 +509,14 @@ def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: P
             created_by_system=True,
         )
 
-        # Store why + micro metadata (still useful for transparency)
+        # Store why + micro metadata on the MAIN mission for transparency
         micro_obj = mission_data.get("micro", {}) or {}
         why_this = mission_data.get("why_this", "") or ""
-        micro_mission.geo_rule_json = {
-    "why": micro_why,
-    "kind": "micro",
-    "parent_mission_id": mission.id,
-    "parent_title": mission.title,
-    "parent_type": mission.type,  # NEW: used by after‑bedtime gate
-    "from_plan_run_id": plan_run.id,
+        mission.geo_rule_json = {
+            "why": why_this,
+            "micro_title": micro_obj.get("title", "") or "",
+            "micro_duration_minutes": _safe_int(micro_obj.get("duration_minutes", 0), 0),
+            "micro_xp_reward": _safe_int(micro_obj.get("xp_reward", 0), 0),
         }
 
         db.add(mission)
@@ -535,7 +544,7 @@ def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: P
             micro_xp = _safe_int(micro_obj.get("xp_reward", 5), 5)
 
             micro_mission = Mission(
-                title=f"🟣 {micro_obj.get('title','').strip()}",
+                title=f"\U0001F7A3 {micro_obj.get('title','').strip()}",
                 type="micro",
                 difficulty="easy",
                 xp_reward=micro_xp,
@@ -550,6 +559,7 @@ def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: P
                 "kind": "micro",
                 "parent_mission_id": mission.id,
                 "parent_title": mission.title,
+                "parent_type": mission.type,  # REQUIRED for bedtime gate
                 "from_plan_run_id": plan_run.id,
             }
 
@@ -593,6 +603,7 @@ def assign_plan_creating_daily_missions(user_id: int, date_str: str, plan_run: P
 
     return True
 
+
 # Existing functions
 
 def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
@@ -606,7 +617,7 @@ def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
         return
 
     missions = []
-    
+
     sleep = float(journal_metrics.get("sleep_hours", 0) or 0)
     if sleep < 7:
         missions.append({
@@ -615,7 +626,7 @@ def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
             "xp_reward": 20,
             "geo_rule_json": {"why": "You slept less than 7 hours."}
         })
-    
+
     study = int(journal_metrics.get("study_minutes", 0) or 0)
     if study < 30:
         missions.append({
@@ -662,13 +673,15 @@ def generate_daily_missions(user_id: int, journal_metrics: dict, db: Session):
         db.add(assign)
     db.commit()
 
+
 def get_todays_missions(user_id: int, db: Session):
     """Get all missions assigned for today."""
     today = date.today().isoformat()
     return db.query(MissionAssignment).filter(
-        MissionAssignment.user_id == user_id, 
+        MissionAssignment.user_id == user_id,
         MissionAssignment.date == today
     ).all()
+
 
 def complete_mission(assignment_id: int, db: Session):
     """Complete a mission assignment."""
@@ -686,23 +699,25 @@ def complete_mission(assignment_id: int, db: Session):
                 "sleep": "Kindness",
                 "nutrition": "Charm",
                 "social": "Charm",
-                "chores": "Guts"
+                "chores": "Guts",
+                "micro": "Proficiency",  # explicit mapping for micro
             }
             stat_type = stat_map.get(mission.type, "Proficiency")
             add_xp(assign.user_id, stat_type, mission.xp_reward, db)
         db.commit()
+
 
 # Swap proposal functions (Step 3C)
 
 def get_pending_missions(user_id: int, date_str: str, db: Session) -> list:
     """
     Get all pending missions for a given date.
-    
+
     Args:
         user_id: User ID
         date_str: YYYY-MM-DD
         db: Database session
-    
+
     Returns:
         List of dicts with {title, type, duration_minutes, xp_reward}
     """
@@ -711,9 +726,9 @@ def get_pending_missions(user_id: int, date_str: str, db: Session) -> list:
         MissionAssignment.date == date_str,
         MissionAssignment.status == "pending"
     ).all()
-    
+
     pending = []
-        for assign in assignments:
+    for assign in assignments:
         mission = db.query(Mission).filter(Mission.id == assign.mission_id).first()
         if mission:
             if (mission.type or "").lower() == "micro":
@@ -724,8 +739,9 @@ def get_pending_missions(user_id: int, date_str: str, db: Session) -> list:
                 "duration_minutes": mission.duration_minutes or 30,
                 "xp_reward": mission.xp_reward or 10
             })
-            
+
     return pending
+
 
 def propose_swaps(
     user_id: int,
@@ -737,7 +753,7 @@ def propose_swaps(
 ) -> dict:
     """
     Propose swaps for pending missions using Gemini.
-    
+
     Args:
         user_id: User ID
         date_str: YYYY-MM-DD
@@ -745,7 +761,7 @@ def propose_swaps(
         db: Database session
         journal_signals_json: Optional journal signals dict
         voice_intent_summary: Optional voice intent dict
-    
+
     Returns:
         Swap JSON dict with schema:
         {
@@ -758,7 +774,7 @@ def propose_swaps(
     """
     # Get pending missions
     pending_missions = get_pending_missions(user_id, date_str, db)
-    
+
     if not pending_missions:
         return {
             "date": date_str,
@@ -767,14 +783,14 @@ def propose_swaps(
             "replacements": [],
             "notes": ""
         }
-    
+
     # Compute time context
     time_context = compute_time_context(user_id, db)
-    
+
     # Determine if after bedtime cutoff
     after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
     effective_mins = time_context.get("effective_mins_to_midnight" if after_bedtime else "effective_mins_to_bedtime", 0)
-    
+
     # Calculate dynamic swap_limit based on remaining time
     if effective_mins < 15:
         swap_limit = 1
@@ -782,16 +798,16 @@ def propose_swaps(
         swap_limit = 2
     else:
         swap_limit = 3
-    
+
     # Build pending missions list for prompt
     pending_str = "\n".join([f"- {m['title']} ({m['type']}, {m['duration_minutes']} mins, +{m['xp_reward']} XP)" for m in pending_missions])
-    
+
     # Build constraints string
     if after_bedtime:
         time_constraint = f"After bedtime cutoff. Only reflection/sleep allowed, easy difficulty, max 15 mins per mission. Time left: {effective_mins} mins (to midnight)."
     else:
         time_constraint = f"Before bedtime cutoff. Any mission type allowed. Time left: {effective_mins} mins (to bedtime), then {time_context.get('effective_mins_to_midnight', 0)} mins to midnight."
-    
+
     # Build signals summary
     signals_str = ""
     if journal_signals_json:
@@ -799,12 +815,12 @@ def propose_swaps(
         energy = journal_signals_json.get("energy", 3)
         stress = journal_signals_json.get("stress", 2)
         signals_str = f"\nJournal signals: mood={mood}, energy={energy}/5, stress={stress}/5. Wins: {journal_signals_json.get('wins', [])}. Needs: {journal_signals_json.get('needs', [])}."
-    
+
     if voice_intent_summary:
         intent = voice_intent_summary.get("intent_summary", "")
         priority = voice_intent_summary.get("priority", "")
         signals_str += f"\nVoice intent: {intent}. Priority: {priority}."
-    
+
     prompt = f"""You are a mission swap assistant. Propose up to {swap_limit} swaps to improve the user's day.
 
 Pending missions:
@@ -823,32 +839,32 @@ Rules:
 6. If you can't improve the day, return swap_count=0 with a short no_swap_reason.
 
 Return ONLY valid JSON, no markdown:
-{{
+{
   "date": "{date_str}",
   "swap_count": 0-{swap_limit},
   "no_swap_reason": "short if swap_count=0, empty otherwise",
   "replacements": [
-    {{
+    {
       "replace_title": "exact title of pending mission to replace",
-      "new_mission": {{
+      "new_mission": {
         "title": "new mission title",
         "type": "study|fitness|sleep|nutrition|reflection|social|chores",
         "difficulty": "easy|medium|hard",
         "duration_minutes": 5-60,
         "xp_reward": 5-60,
         "stat_targets": ["stat1", "stat2"],
-        "micro": {{"title": "micro title", "duration_minutes": 1-5, "xp_reward": 3-15"}},
+        "micro": {"title": "micro title", "duration_minutes": 1-5, "xp_reward": 3-15"},
         "why_this": "one sentence why"
-      }},
+      },
       "reason": "1-2 sentence reason for swap"
-    }}
+    }
   ],
   "notes": "brief note"
-}}"""
-    
+}"""
+
     # Call Gemini
     swap_json = call_gemini_json(prompt, temperature=0.25, max_tokens=700)
-    
+
     if not swap_json:
         # Fallback: no swaps
         return {
@@ -858,7 +874,7 @@ Return ONLY valid JSON, no markdown:
             "replacements": [],
             "notes": ""
         }
-    
+
     # Ensure required keys exist
     if "swap_count" not in swap_json:
         swap_json["swap_count"] = 0
@@ -868,53 +884,54 @@ Return ONLY valid JSON, no markdown:
         swap_json["no_swap_reason"] = ""
     if "notes" not in swap_json:
         swap_json["notes"] = ""
-    
+
     # Enforce swap_count <= swap_limit
     swap_json["swap_count"] = min(swap_json.get("swap_count", 0), swap_limit)
-    
+
     return swap_json
+
 
 def validate_swap_plan(swap_json: dict, pending_missions: list, time_context: dict) -> tuple:
     """
     Validate swap JSON against all rules.
-    
+
     Args:
         swap_json: Output from propose_swaps()
         pending_missions: List of pending missions (from get_pending_missions())
         time_context: Output from compute_time_context()
-    
+
     Returns:
         (is_valid, error_list)
     """
     errors = []
-    
+
     # Validate swap_json structure
     if not swap_json or "swap_count" not in swap_json:
         errors.append("Invalid swap JSON: missing swap_count")
         return False, errors
-    
+
     swap_count = swap_json.get("swap_count", 0)
     replacements = swap_json.get("replacements", [])
     no_swap_reason = swap_json.get("no_swap_reason", "")
-    
+
     # Calculate swap_limit from time_context
     after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
     effective_mins = time_context.get("effective_mins_to_midnight" if after_bedtime else "effective_mins_to_bedtime", 0)
-    
+
     if effective_mins < 15:
         swap_limit = 1
     elif effective_mins < 30:
         swap_limit = 2
     else:
         swap_limit = 3
-    
+
     # Validate swap_count
     if swap_count < 0 or swap_count > 3:
         errors.append(f"swap_count must be 0-3, got {swap_count}")
-    
+
     if swap_count > swap_limit:
         errors.append(f"swap_count {swap_count} exceeds time-based limit {swap_limit}")
-    
+
     # Validate swap_count == 0 -> replacements empty and no_swap_reason present
     if swap_count == 0:
         if replacements:
@@ -923,30 +940,30 @@ def validate_swap_plan(swap_json: dict, pending_missions: list, time_context: di
             errors.append("If swap_count==0, no_swap_reason must be present")
         # If swap_count=0, we're done
         return len(errors) == 0, errors
-    
+
     # Validate swap_count > 0 -> replacements must match
     if len(replacements) != swap_count:
         errors.append(f"swap_count={swap_count} but got {len(replacements)} replacements")
-    
+
     # Get list of pending mission titles
     pending_titles = [m["title"] for m in pending_missions]
     replaced_titles = set()
-    
+
     total_duration = 0
-    
+
     for i, repl in enumerate(replacements):
         replace_title = repl.get("replace_title", "")
         new_mission = repl.get("new_mission", {})
-        
+
         # Check replace_title exists
         if replace_title not in pending_titles:
             errors.append(f"Replacement {i}: replace_title '{replace_title}' not found in pending missions")
-        
+
         # Check for duplicates
         if replace_title in replaced_titles:
             errors.append(f"Replacement {i}: duplicate replace_title '{replace_title}'")
         replaced_titles.add(replace_title)
-        
+
         # Validate new_mission
         m_type = new_mission.get("type", "")
         m_difficulty = new_mission.get("difficulty", "")
@@ -954,11 +971,11 @@ def validate_swap_plan(swap_json: dict, pending_missions: list, time_context: di
         m_xp = new_mission.get("xp_reward", 0)
         micro = new_mission.get("micro", {})
         title = new_mission.get("title", "")
-        
+
         # Type check
         if m_type not in ALLOWED_MISSION_TYPES:
             errors.append(f"Replacement {i}: invalid type '{m_type}'")
-        
+
         # After bedtime rules
         if after_bedtime:
             if m_type not in WIND_DOWN_TYPES:
@@ -967,26 +984,26 @@ def validate_swap_plan(swap_json: dict, pending_missions: list, time_context: di
                 errors.append(f"Replacement {i}: after bedtime, must be easy difficulty")
             if m_duration > 15:
                 errors.append(f"Replacement {i}: after bedtime, max 15 minutes, got {m_duration}")
-        
+
         # Duration and XP ranges
         if m_duration < 5 or m_duration > 60:
             errors.append(f"Replacement {i}: duration {m_duration} not in 5-60 range")
-        
+
         if m_xp < 5 or m_xp > 60:
             errors.append(f"Replacement {i}: xp {m_xp} not in 5-60 range")
-        
+
         # Micro required and duration <= 5
         if not micro or "title" not in micro:
             errors.append(f"Replacement {i}: micro mission required")
         elif micro.get("duration_minutes", 0) > 5:
             errors.append(f"Replacement {i}: micro duration must be <= 5 mins")
-        
+
         # Unsafe keywords
         if any(kw in title.lower() for kw in UNSAFE_KEYWORDS):
             errors.append(f"Replacement {i}: unsafe content in title")
-        
+
         total_duration += m_duration
-    
+
     # Time constraint check
     if after_bedtime:
         time_limit = time_context.get("effective_mins_to_midnight", 0)
@@ -996,41 +1013,42 @@ def validate_swap_plan(swap_json: dict, pending_missions: list, time_context: di
         time_limit = time_context.get("effective_mins_to_bedtime", 0)
         if total_duration > time_limit:
             errors.append(f"Before bedtime: total replacement duration {total_duration} exceeds bedtime limit {time_limit} mins")
-    
+
     return len(errors) == 0, errors
+
 
 def apply_swaps(user_id: int, date_str: str, swap_json: dict, db: Session, source: str = "missions_page") -> PlanRun:
     """
     Apply validated swaps: archive old pending assignments, create new missions and assignments.
-    
+
     Args:
         user_id: User ID
         date_str: YYYY-MM-DD
         swap_json: Validated swap JSON (should pass validate_swap_plan first)
         db: Database session
         source: Origin ("missions_page", "journal", or "voice")
-    
+
     Returns:
         PlanRun object with kind="swap", status="assigned"
     """
     # Get pending missions and time context for meta_json
     pending_missions = get_pending_missions(user_id, date_str, db)
     time_context = compute_time_context(user_id, db)
-    
+
     # Calculate swap_limit
     after_bedtime = time_context.get("effective_mins_to_bedtime", 0) == 0
     effective_mins = time_context.get("effective_mins_to_midnight" if after_bedtime else "effective_mins_to_bedtime", 0)
-    
+
     if effective_mins < 15:
         swap_limit = 1
     elif effective_mins < 30:
         swap_limit = 2
     else:
         swap_limit = 3
-    
+
     swap_count = swap_json.get("swap_count", 0)
     replacements = swap_json.get("replacements", [])
-    
+
     # Create PlanRun for this swap batch
     plan_run = PlanRun(
         user_id=user_id,
@@ -1049,26 +1067,26 @@ def apply_swaps(user_id: int, date_str: str, swap_json: dict, db: Session, sourc
     db.add(plan_run)
     db.commit()
     db.refresh(plan_run)
-    
+
     # Process replacements
     for swap_index, repl in enumerate(replacements):
         replace_title = repl.get("replace_title", "")
         new_mission_data = repl.get("new_mission", {})
-        
+
         # Find and archive the pending assignment
         old_assign = db.query(MissionAssignment).filter(
             MissionAssignment.user_id == user_id,
             MissionAssignment.date == date_str,
             MissionAssignment.status == "pending"
         ).join(Mission).filter(Mission.title == replace_title).first()
-        
+
         if old_assign:
             old_assign.status = "archived"
             if old_assign.proof_json is None:
                 old_assign.proof_json = {}
             old_assign.proof_json["swapped_out"] = True
             old_assign.proof_json["swap_plan_run_id"] = plan_run.id
-        
+
         # Create new mission
         new_mission = Mission(
             title=new_mission_data.get("title", ""),
@@ -1079,12 +1097,12 @@ def apply_swaps(user_id: int, date_str: str, swap_json: dict, db: Session, sourc
             created_for_date=date_str,
             created_by_system=True
         )
-        
+
         # Store micro and why_this in geo_rule_json
         micro = new_mission_data.get("micro", {})
         why_this = new_mission_data.get("why_this", "")
         reason = repl.get("reason", "")
-        
+
         new_mission.geo_rule_json = {
             "why": why_this,
             "swap_reason": reason,
@@ -1093,11 +1111,11 @@ def apply_swaps(user_id: int, date_str: str, swap_json: dict, db: Session, sourc
             "micro_xp_reward": micro.get("xp_reward", 0),
             "swap_index": swap_index
         }
-        
+
         db.add(new_mission)
         db.commit()
         db.refresh(new_mission)
-        
+
         # Create assignment linked to swap PlanRun
         new_assign = MissionAssignment(
             user_id=user_id,
@@ -1107,9 +1125,9 @@ def apply_swaps(user_id: int, date_str: str, swap_json: dict, db: Session, sourc
             plan_run_id=plan_run.id
         )
         db.add(new_assign)
-    
+
     db.commit()
-    
+
     # Log to AuditLog if available
     try:
         audit = AuditLog(
@@ -1128,5 +1146,5 @@ def apply_swaps(user_id: int, date_str: str, swap_json: dict, db: Session, sourc
     except Exception:
         # AuditLog may not exist, silently pass
         pass
-    
+
     return plan_run
