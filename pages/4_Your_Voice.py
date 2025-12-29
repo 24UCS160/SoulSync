@@ -12,6 +12,9 @@ try:
 except Exception:
     extract_voice_intent_summary = None
 
+# --- Micro suggestions need time context safety rules ---
+from soulsync.services.missions import compute_time_context  # NEW
+
 load_css()
 
 if "user" not in st.session_state:
@@ -120,6 +123,90 @@ try:
     if st.session_state.get("latest_voice_intent"):
         vi = st.session_state["latest_voice_intent"]
         st.caption(f"🧭 Intent summary saved for planning: **{vi.get('intent_summary','')}**")
+
+    st.divider()
+
+    # ---------------------------
+    # Micro Suggestions (≤5 min)
+    # ---------------------------
+    st.subheader("Suggested Micro Actions (≤5 min)")
+    # Compute time context to respect wind-down rules after bedtime
+    time_ctx = compute_time_context(user_id, db)
+    after_bedtime = time_ctx.get("effective_mins_to_bedtime", 0) == 0
+    if after_bedtime:
+        st.info("🌙 After bedtime: gentle wind‑down. Reflection/sleep micros only.")
+
+    # Read current voice mode & intent for light personalization
+    vm = st.session_state.voice_mode
+    vi = st.session_state.get("latest_voice_intent") or {"priority": "other", "intent_summary": ""}
+    priority = (vi.get("priority") or "other").lower()
+
+    # Base pool (titles, type, minutes, emoji)
+    micro_pool = [
+        {"title": "Two‑minute breathe/reset", "type": "reflection", "minutes": 2, "emoji": "🫧"},
+        {"title": "Micro journal line", "type": "reflection", "minutes": 3, "emoji": "📝"},
+        {"title": "Prepare sleep spot", "type": "sleep", "minutes": 5, "emoji": "🛏️"},
+        {"title": "Quick stretch", "type": "fitness", "minutes": 3, "emoji": "🤸"},
+        {"title": "Refill water", "type": "nutrition", "minutes": 2, "emoji": "💧"},
+        {"title": "Text a friend hello", "type": "social", "minutes": 3, "emoji": "👋"},
+        {"title": "Desk tidy micro", "type": "chores", "minutes": 3, "emoji": "🧹"},
+    ]
+
+    # Filter for after-bedtime
+    if after_bedtime:
+        micro_pool = [m for m in micro_pool if m["type"] in ("reflection", "sleep")]
+
+    # Light personalization based on voice mode / intent priority
+    tailored = []
+    for m in micro_pool:
+        # If mode is "Reflect with me" -> favor reflection
+        if vm == "Reflect with me" and m["type"] == "reflection":
+            tailored.append(m); continue
+        # If mode is "Study buddy" or priority hints "study" -> prefer quick focus reset + water/stretch
+        if vm == "Study buddy" or priority == "study":
+            if m["type"] in ("reflection", "nutrition", "fitness"):
+                tailored.append(m); continue
+        # If mode is "Cheer me on" -> keep uplifting, simple actions
+        if vm == "Cheer me on":
+            if m["type"] in ("reflection", "social", "nutrition"):
+                tailored.append(m); continue
+        # If mode is "Help me plan" -> a neutral mix
+        tailored.append(m)
+
+    # Deduplicate and cap
+    seen = set()
+    suggestions = []
+    for m in tailored:
+        key = (m["title"], m["type"])
+        if key in seen:
+            continue
+        seen.add(key)
+        suggestions.append(m)
+    suggestions = suggestions[:4]
+
+    if suggestions:
+        for idx, m in enumerate(suggestions, start=1):
+            cols = st.columns([6, 2])
+            with cols[0]:
+                st.markdown(f"**{m['emoji']} {m['title']}**")
+                st.caption(f"Micro • {m['type']} • {m['minutes']} min")
+            with cols[1]:
+                if st.button("Use this now →", key=f"btn_voice_micro_{idx}"):
+                    # Save current voice intent for Missions planner/swapper context
+                    st.session_state["latest_voice_intent"] = _build_voice_intent_from_recent(history)
+                    # Optional hint: could be read by Missions page if desired
+                    st.session_state["micro_hint"] = {
+                        "title": m["title"],
+                        "type": m["type"],
+                        "minutes": m["minutes"],
+                    }
+                    st.session_state["open_swaps_on_missions"] = False
+                    try:
+                        st.switch_page("pages/2_Missions.py")
+                    except Exception:
+                        st.info("Go to the Missions page to apply micro actions or build your plan.")
+    else:
+        st.caption("No micro suggestions right now. You can still build a plan or suggest swaps.")
 
     st.divider()
 
