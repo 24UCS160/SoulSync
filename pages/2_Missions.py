@@ -16,12 +16,16 @@ from soulsync.services.missions import (
     propose_swaps,
     validate_swap_plan,
     apply_swaps,
+    # --- Micro: gating + completion ---
+    can_mark_micro_now,
+    mark_micro_completed,
 )
 from soulsync.services.streak import (
     check_and_handle_streak_break,
     reset_shields_if_new_week,
     complete_recovery_mission,
 )
+from soulsync.services.mood_suggester import suggest_mood_actions  # NEW for C: Mood suggestions
 from soulsync.ui.theme import load_css
 
 load_css()
@@ -52,6 +56,72 @@ try:
         f"🌙 Wind-down until midnight: **{mins_to_mid} min**"
     )
 
+    # Optional banner showing an active micro hint
+    micro_hint = st.session_state.get("micro_hint")
+    if micro_hint:
+        st.info(
+            f"✨ Suggested micro: **{micro_hint.get('title','')}** "
+            f"({micro_hint.get('type','')}, {micro_hint.get('minutes',0)} min)"
+        )
+        # Clear once shown to avoid sticking around
+        st.session_state.pop("micro_hint", None)
+
+    # ------------------------------------------------------------
+    # C: Mood suggestions (gentle banner, ≤5 min; respects wind-down)
+    # ------------------------------------------------------------
+    journal_signals = st.session_state.get("latest_journal_signals", None)
+    voice_intent = st.session_state.get("latest_voice_intent", None)
+
+    if "hide_mood_suggestions" not in st.session_state:
+        st.session_state["hide_mood_suggestions"] = False
+
+    with st.container():
+        col_ms_a, col_ms_b = st.columns([6, 1])
+        with col_ms_a:
+            st.subheader("✨ Mood suggestions")
+        with col_ms_b:
+            if st.button(("Hide" if not st.session_state["hide_mood_suggestions"] else "Show"),
+                         key="btn_toggle_mood_suggestions"):
+                st.session_state["hide_mood_suggestions"] = not st.session_state["hide_mood_suggestions"]
+                st.rerun()
+
+        if not st.session_state["hide_mood_suggestions"]:
+            try:
+                mood_suggestions = suggest_mood_actions(
+                    user_id=user_id,
+                    db=db,
+                    signals=journal_signals,
+                    voice_intent=voice_intent,
+                    time_context=time_ctx,
+                    max_suggestions=4,
+                )
+            except Exception as e:
+                mood_suggestions = []
+                st.warning(f"Couldn’t load mood suggestions: {str(e)[:120]}")
+
+            if mood_suggestions:
+                for idx, m in enumerate(mood_suggestions, start=1):
+                    cols = st.columns([6, 2])
+                    with cols[0]:
+                        st.markdown(f"**{m['emoji']} {m['title']}**")
+                        st.caption(f"{m['type']} • {m['minutes']} min")
+                        if m.get("reason"):
+                            st.caption(m["reason"])
+                    with cols[1]:
+                        # Keep hybrid workflow—actions happen via Missions tools
+                        if st.button("Use micro →", key=f"btn_mood_micro_{idx}"):
+                            # Hand the hint to Missions micro flow; a friendly banner shows
+                            st.session_state["micro_hint"] = {
+                                "title": m["title"],
+                                "type": m["type"],
+                                "minutes": m["minutes"],
+                                "source": "mood",
+                            }
+                            st.success("Micro hint added. Scroll to your micro missions and tap ✅ Micro.")
+                            st.rerun()
+            else:
+                st.caption("No suggestions right now. You can still build a plan or suggest swaps.")
+
     missions = get_todays_missions(user_id, db)
 
     # -------------------------
@@ -70,15 +140,65 @@ try:
                 continue
 
             recovery_badge = "🛡️ Recovery" if getattr(mission, "is_recovery", False) else ""
+            mtype = (mission.type or "").lower()
 
-            with st.container():
+            # Common "why" text + metadata
+            why_text = ""
+            meta = {}
+            try:
+                if mission.geo_rule_json:
+                    meta = mission.geo_rule_json or {}
+                    why_text = meta.get("why", "") or ""
+            except Exception:
+                meta = {}
                 why_text = ""
-                try:
-                    if mission.geo_rule_json:
-                        why_text = mission.geo_rule_json.get("why", "") or ""
-                except Exception:
-                    why_text = ""
 
+            # -------------------------
+            # MICRO mission card + button
+            # -------------------------
+            if mtype == "micro":
+                parent_title = (meta.get("parent_title") or "").strip()
+                parent_type = (meta.get("parent_type") or "").strip()
+
+                with st.container():
+                    st.markdown(
+                        f"""
+                        <div class="ss-card">
+                            <span class="ss-chip">micro</span>
+                            <span class="ss-chip">+{mission.xp_reward or 0} XP</span>
+                            <h3>{mission.title}</h3>
+                            <p><i>{why_text}</i></p>
+                            {f'<p>From: {parent_title} ({parent_type})</p>' if parent_title else ''}
+                            {f'<p>Duration: {mission.duration_minutes} mins</p>' if getattr(mission, "duration_minutes", None) else ''}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    if assign.status == "pending":
+                        ok, reason = can_mark_micro_now(assign, time_ctx, db)
+                        clicked = st.button(
+                            "✅ Micro",
+                            key=f"btn_micro_{assign.id}",
+                            disabled=not ok,
+                            help=None if ok else (reason or "Not allowed now."),
+                        )
+                        if clicked:
+                            res = mark_micro_completed(assign.id, db)
+                            if res.get("ok"):
+                                st.success("Micro completed! 🎉 +tiny XP")
+                            else:
+                                errs = res.get("errors") or ["Error completing micro"]
+                                st.error(" ".join(errs))
+                            st.rerun()
+                    else:
+                        st.write("✅ Completed")
+                continue  # skip normal flow for micro missions
+
+            # -------------------------
+            # NORMAL mission card + button
+            # -------------------------
+            with st.container():
                 st.markdown(
                     f"""
                     <div class="ss-card">
@@ -114,10 +234,6 @@ try:
     # -----------------------------------------
     st.subheader("🔁 AI Swaps (up to 3)")
     st.write("Use AI to intelligently swap up to 3 **pending** missions based on your Journal + Your Voice context.")
-
-    # Optional context pushed from Journal/Voice pages (3F-2/3F-3 later)
-    journal_signals = st.session_state.get("latest_journal_signals", None)
-    voice_intent = st.session_state.get("latest_voice_intent", None)
 
     pending = get_pending_missions(user_id, today, db)
 
