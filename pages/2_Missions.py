@@ -25,7 +25,13 @@ from soulsync.services.streak import (
     reset_shields_if_new_week,
     complete_recovery_mission,
 )
-from soulsync.services.mood_suggester import suggest_mood_actions  # NEW for C: Mood suggestions
+from soulsync.services.mood_suggester import suggest_mood_actions  # C: Mood suggestions
+from soulsync.services.party import (  # E: Party missions
+    get_or_create_party_roster,
+    propose_party_missions,
+    preview_party_missions,
+    apply_party_missions,
+)
 from soulsync.ui.theme import load_css
 
 load_css()
@@ -108,9 +114,7 @@ try:
                         if m.get("reason"):
                             st.caption(m["reason"])
                     with cols[1]:
-                        # Keep hybrid workflow—actions happen via Missions tools
                         if st.button("Use micro →", key=f"btn_mood_micro_{idx}"):
-                            # Hand the hint to Missions micro flow; a friendly banner shows
                             st.session_state["micro_hint"] = {
                                 "title": m["title"],
                                 "type": m["type"],
@@ -122,11 +126,88 @@ try:
             else:
                 st.caption("No suggestions right now. You can still build a plan or suggest swaps.")
 
-    missions = get_todays_missions(user_id, db)
+    st.divider()
+
+    # ------------------------------------------------------------
+    # E: Party Missions (MVP)
+    # ------------------------------------------------------------
+    st.subheader("🧑‍🤝‍🧑 Party")
+    try:
+        roster = get_or_create_party_roster(user_id, db)
+    except Exception as e:
+        roster = []
+        st.warning(f"Couldn’t load party roster: {str(e)[:120]}")
+
+    if roster:
+        cols = st.columns(len(roster))
+        for i, member in enumerate(roster):
+            with cols[i]:
+                st.markdown(f"**{member.get('emoji','')} {member.get('name','')}**")
+                st.caption(member.get("role",""))
+    else:
+        st.caption("No party roster available.")
+
+    col_p1, col_p2 = st.columns([1, 1])
+    with col_p1:
+        if st.button("Suggest party missions 🎭", key="btn_party_suggest"):
+            party_json = propose_party_missions(
+                user_id=user_id,
+                date_str=today,
+                db=db,
+                journal_signals=journal_signals,
+                voice_intent=voice_intent,
+                time_context=time_ctx,
+                max_count=2,
+            )
+            st.session_state["party_preview"] = party_json
+            st.rerun()
+    with col_p2:
+        if st.button("Clear party preview", key="btn_party_clear"):
+            st.session_state.pop("party_preview", None)
+            st.rerun()
+
+    party_preview = st.session_state.get("party_preview")
+    if party_preview:
+        st.markdown("### Party Preview")
+        count = int(party_preview.get("count", 0) or 0)
+        if count == 0:
+            st.warning(party_preview.get("notes", "No party suggestions."))
+        else:
+            repls = party_preview.get("replacements") or []
+            for idx, r in enumerate(repls, start=1):
+                member = r.get("member", {}) or {}
+                m = r.get("mission", {}) or {}
+                st.markdown(
+                    f"**{idx}. {member.get('emoji','')} {member.get('name','')} ({member.get('role','')})** → "
+                    f"**{m.get('title','')}** "
+                    f"({m.get('type','')}, {m.get('difficulty','')}, {m.get('duration_minutes',0)} mins, +{m.get('xp_reward',0)} XP)"
+                )
+                if r.get("reason"):
+                    st.caption(f"Reason: {r.get('reason')}")
+
+        # Enable apply if there is at least one suggestion
+        apply_disabled = (count == 0)
+        if st.button("Apply party missions", type="primary", disabled=apply_disabled, key="btn_party_apply"):
+            try:
+                apply_party_missions(
+                    user_id=user_id,
+                    date_str=today,
+                    party_json=party_preview,
+                    db=db,
+                    source="missions_page",
+                )
+                st.success("Party missions assigned ✅")
+                st.session_state.pop("party_preview", None)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error applying party missions: {str(e)[:160]}")
+
+    st.divider()
 
     # -------------------------
     # Display existing missions
     # -------------------------
+    missions = get_todays_missions(user_id, db)
     if missions:
         col1, col2 = st.columns([2, 1])
         with col1:
@@ -199,12 +280,19 @@ try:
             # NORMAL mission card + button
             # -------------------------
             with st.container():
+                # Party badge if present
+                party_badge = ""
+                party_member = (meta.get("party_member") or {}) if meta else {}
+                if party_member.get("name"):
+                    party_badge = f"{party_member.get('emoji','')} {party_member.get('name')} ({party_member.get('role','')})"
+
                 st.markdown(
                     f"""
                     <div class="ss-card">
                         <span class="ss-chip">{mission.type}</span>
                         <span class="ss-chip">+{mission.xp_reward} XP</span>
                         {f'<span class="ss-chip">{recovery_badge}</span>' if recovery_badge else ''}
+                        {f'<span class="ss-chip">{party_badge}</span>' if party_badge else ''}
                         <h3>{mission.title}</h3>
                         <p><i>{why_text}</i></p>
                         {f'<p>Duration: {mission.duration_minutes} mins</p>' if getattr(mission, "duration_minutes", None) else ''}
@@ -343,11 +431,10 @@ try:
         with c2:
             if st.button("Cancel", key="btn_regen_cancel"):
                 st.session_state.show_regen_confirm = False
-                st.rerun()
+                st.run()
 
     if st.button("Generate AI Plan", key="btn_generate_plan"):
         try:
-            # Build context (optionally include journal/voice context if present)
             context = build_planner_context(
                 user_id,
                 today,
@@ -356,33 +443,27 @@ try:
                 journal_signals_json=journal_signals,
                 voice_intent_summary=(voice_intent.get("intent_summary") if isinstance(voice_intent, dict) else None),
             )
-
-            # Generate
             plan_json = generate_ai_plan_json(context)
 
             if not plan_json:
                 st.error("AI planner failed. Please try again or use basic mode.")
             else:
-                # Validate
                 time_context = context.get("time_context", {})
                 is_valid, errors = validate_plan(plan_json, minutes_cap, time_context)
 
                 if not is_valid:
                     st.error(f"Plan validation failed: {', '.join(errors[:3])}")
                 else:
-                    # Preview
                     plan_run, _ = preview_plan(
                         user_id, today, "missions_page", plan_json,
                         time_context, minutes_cap, db
                     )
-
                     st.session_state.preview_plan_run_id = plan_run.id
                     st.session_state.show_plan_preview = True
                     st.rerun()
         except Exception as e:
             st.error(f"Error generating plan: {str(e)[:200]}")
 
-    # Show plan preview if available
     if st.session_state.get("show_plan_preview") and st.session_state.get("preview_plan_run_id"):
         plan_run = db.query(PlanRun).filter(PlanRun.id == st.session_state.preview_plan_run_id).first()
 
