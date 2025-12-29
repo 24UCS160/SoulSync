@@ -266,20 +266,21 @@ def generate_ai_plan_json(context: dict) -> dict:
     time_ctx = context.get("time_context", {})
     after_bedtime = time_ctx.get("effective_mins_to_bedtime", 0) == 0
 
-    prompt = f"""You are a student life RPG mission planner. Generate a JSON plan for today.
+    # Use a template with escaped braces and format to avoid f-string brace parsing issues
+    prompt_template = """You are a student life RPG mission planner. Generate a JSON plan for today.
 
-User: {context.get('user_handle')}
-Current Streak: {context.get('streak_count')} days
-Last 7 days completed: {context.get('last_7_days_completed')} missions
-Minutes available today: {context.get('minutes_cap')}
+User: {user_handle}
+Current Streak: {streak_count} days
+Last 7 days completed: {last7} missions
+Minutes available today: {minutes_cap}
 
 Time context:
-- Time to bedtime cutoff: {time_ctx.get('effective_mins_to_bedtime', 0)} mins
-- Time to midnight: {time_ctx.get('effective_mins_to_midnight', 0)} mins
+- Time to bedtime cutoff: {mins_bed} mins
+- Time to midnight: {mins_mid} mins
 - After bedtime cutoff: {after_bedtime}
 
-Journal signals (if any): {json.dumps(context.get('journal_signals', {}))}
-Voice intent (if any): {context.get('voice_intent', '')}
+Journal signals (if any): {journal_signals}
+Voice intent (if any): {voice_intent}
 
 STRICT RULES:
 1. Generate 5-7 missions
@@ -287,7 +288,7 @@ STRICT RULES:
 3. Difficulties: easy, medium, hard
 4. Duration: 5-60 minutes each
 5. XP: 5-60 per mission
-6. Total duration <= {context.get('minutes_cap')} minutes
+6. Total duration <= {minutes_cap} minutes
 7. Include at least one micro mission (<=5 mins)
 8. Each mission needs stat_targets array
 9. NO profanity or adult content
@@ -299,23 +300,34 @@ AFTER BEDTIME ({after_bedtime}):
 - If true: Prefer micro missions
 
 Return ONLY valid JSON, no markdown:
-{
+{{
   "date": "YYYY-MM-DD",
   "timezone": "Area/City",
   "missions": [
-    {
+    {{
       "title": "mission title",
       "type": "study|fitness|sleep|nutrition|reflection|social|chores",
       "difficulty": "easy|medium|hard",
       "duration_minutes": 5-60,
       "xp_reward": 5-60,
       "stat_targets": ["knowledge", "guts", "proficiency", "kindness", "charm"],
-      "micro": {"title": "short title", "duration_minutes": 1-5, "xp_reward": 3-15},
+      "micro": {{"title": "short title", "duration_minutes": 1-5, "xp_reward": 3-15}},
       "why_this": "one sentence why"
-    }
+    }}
   ],
   "notes": "brief note"
-}"""
+}}"""
+    prompt = prompt_template.format(
+        user_handle=context.get('user_handle'),
+        streak_count=context.get('streak_count'),
+        last7=context.get('last_7_days_completed'),
+        minutes_cap=context.get('minutes_cap'),
+        mins_bed=time_ctx.get('effective_mins_to_bedtime', 0),
+        mins_mid=time_ctx.get('effective_mins_to_midnight', 0),
+        after_bedtime=after_bedtime,
+        journal_signals=json.dumps(context.get('journal_signals', {})),
+        voice_intent=context.get('voice_intent', ''),
+    )
 
     return call_gemini_json(prompt, temperature=0.3, max_tokens=900)
 
@@ -821,7 +833,8 @@ def propose_swaps(
         priority = voice_intent_summary.get("priority", "")
         signals_str += f"\nVoice intent: {intent}. Priority: {priority}."
 
-    prompt = f"""You are a mission swap assistant. Propose up to {swap_limit} swaps to improve the user's day.
+    # Use a template with escaped braces and format to avoid f-string brace parsing issues
+    prompt_template = """You are a mission swap assistant. Propose up to {swap_limit} swaps to improve the user's day.
 
 Pending missions:
 {pending_str}
@@ -839,28 +852,35 @@ Rules:
 6. If you can't improve the day, return swap_count=0 with a short no_swap_reason.
 
 Return ONLY valid JSON, no markdown:
-{
+{{
   "date": "{date_str}",
   "swap_count": 0-{swap_limit},
   "no_swap_reason": "short if swap_count=0, empty otherwise",
   "replacements": [
-    {
+    {{
       "replace_title": "exact title of pending mission to replace",
-      "new_mission": {
+      "new_mission": {{
         "title": "new mission title",
         "type": "study|fitness|sleep|nutrition|reflection|social|chores",
         "difficulty": "easy|medium|hard",
         "duration_minutes": 5-60,
         "xp_reward": 5-60,
         "stat_targets": ["stat1", "stat2"],
-        "micro": {"title": "micro title", "duration_minutes": 1-5, "xp_reward": 3-15"},
+        "micro": {{"title": "micro title", "duration_minutes": 1-5, "xp_reward": 3-15}},
         "why_this": "one sentence why"
-      },
+      }},
       "reason": "1-2 sentence reason for swap"
-    }
+    }}
   ],
   "notes": "brief note"
-}"""
+}}"""
+    prompt = prompt_template.format(
+        swap_limit=swap_limit,
+        pending_str=pending_str,
+        time_constraint=time_constraint,
+        signals_str=signals_str,
+        date_str=date_str,
+    )
 
     # Call Gemini
     swap_json = call_gemini_json(prompt, temperature=0.25, max_tokens=700)
